@@ -19,3 +19,26 @@ Stage Summary:
 - Deliverable: complete, playable echolocation horror game at `/` — 90% black screen, white expanding wireframe ping rings that briefly reveal the maze, fully synthesized spatial audio, monster with hearing/investigate/chase AI, 3 keys + locked exit door, win/death screens, run persistence via Prisma + /api/runs leaderboard, local best time, touch support.
 - Key files: src/lib/game/{maze,audio,engine}.ts, src/components/sonar-room.tsx, src/app/api/runs/route.ts, src/lib/db.ts, prisma/schema.prisma, src/app/page.tsx.
 - Balance constants live at the top of engine.ts (PING_*, PLAYER_SPEED, SENSE_R, LOSE_R, HEAR_R, CATCH_R, GRACE) for easy tuning.
+
+---
+Task ID: 2
+Agent: AI Assistant (main)
+Task: Fix "for mobiles, the joystick does not work properly" — diagnose and repair touch controls in The Sonar Room.
+
+Work Log:
+- Diagnosed four root causes in src/components/sonar-room.tsx:
+  (1) joystick only rendered after touchMode flipped true, which required a blind canvas tap first (also wasting a ping and alerting the monster);
+  (2) the pad lacked touch-action: none, so iOS/Android hijacked drags as pan/pull-to-refresh gestures and fired pointercancel — knob froze after a few px (the classic mobile joystick killer);
+  (3) pointer capture was taken on e.target instead of e.currentTarget, with no lostpointercapture recovery, so a stolen pointer left the stick stuck on;
+  (4) no deadzone — finger jitter crept the player around.
+- Rewrote joystick handlers: resetJoy() helper, capture on currentTarget with try/catch, onLostPointerCapture safety net, deadzone (0.18) with remap-to-full-speed curve, knob now tracks raw clamped offset; enlarged touch zone to 176px (h-44 w-44) with the 128px visual ring centered inside; pad gets touch-none select-none.
+- Auto-show joystick on touch-capable devices: detection (pointer: coarse / maxTouchPoints / ontouchstart) runs inside startGame (event handler, lint-safe) so the stick is visible from the first frame; touch-aware hint (TAP — PING / STICK — MOVE, positioned above the pad) and touch-aware menu control rows.
+- Reset held controls on run end/start (loop guard + startGame) so the player never slides after death.
+- Page hardening: wrapper overscroll-none; global button touch-action: manipulation + tap-highlight transparent; added Next.js Viewport export in layout.tsx (maximumScale 1, userScalable false, viewportFit cover) to stop pinch/double-tap zoom fighting the controls.
+- Lint fixes along the way: react-hooks/immutability (moved resetJoy above first use), react-hooks/set-state-in-effect (deferred loadEscapes + touch detection out of the effect body; removed the queueMicrotask touch-detection block in favor of startGame), plus repaired an intermediate bad edit that had duplicated onCanvasPointerDown.
+- Browser-verified under iPhone 14 emulation (agent-browser set device + in-page maxTouchPoints stub since set device alone didn't apply touch): pad exists immediately after BEGIN with computed touch-action none; touch pointer drag (pointerId-scoped, pointerType touch) moved the player 69→357.8px at full speed with input (1,0); pointerup zeroed input, stopped the player, recentered the knob; lostpointercapture mid-hold released the stuck stick (0,-1 → 0,0); tap-to-ping on canvas incremented pingsUsed; keyboard regression clean (KeyD moved 106px); death by monster re-confirmed ("IT FOUND YOU" overlay); zero console/page errors; dev.log clean.
+
+Stage Summary:
+- Mobile joystick fully functional: visible from game start on touch devices, immune to browser gesture theft (touch-action none + capture + lost-capture reset), deadzone + full-speed curve, auto-reset on death/win/blur.
+- Desktop/keyboard paths unchanged and re-verified; lint clean; temp debug handle removed.
+- Files touched: src/components/sonar-room.tsx, src/app/layout.tsx (Viewport export only).

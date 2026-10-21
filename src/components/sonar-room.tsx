@@ -59,6 +59,13 @@ export default function SonarRoom() {
     toastTimeoutRef.current = window.setTimeout(() => setToast(null), 2600)
   }, [])
 
+  // ------------------------------------------------------------- joystick
+  const resetJoy = useCallback(() => {
+    joyIdRef.current = null
+    joyRef.current = { x: 0, y: 0, active: false }
+    if (knobRef.current) knobRef.current.style.transform = 'translate(-50%, -50%)'
+  }, [])
+
   const loadEscapes = useCallback(async () => {
     try {
       const res = await fetch('/api/runs', { cache: 'no-store' })
@@ -107,15 +114,21 @@ export default function SonarRoom() {
     const audio = audioRef.current
     const engine = engineRef.current
     if (!audio || !engine) return
+    // Touch-capable devices get the joystick from the very first frame —
+    // never make a blind player tap first just to unlock their controls.
+    const coarse = window.matchMedia?.('(pointer: coarse)').matches ?? false
+    const touchable = (navigator.maxTouchPoints ?? 0) > 0 || 'ontouchstart' in window
+    if (coarse || touchable) setTouchMode(true)
     audio.ensure()
     window.clearTimeout(endDelayRef.current)
+    resetJoy()
     setResult(null)
     setKeysFound(0)
     setToast(null)
     setMenuVisible(false)
     engine.start()
     setPhase('playing')
-  }, [setPhase])
+  }, [resetJoy, setPhase])
 
   // ------------------------------------------------------------ bootstrap
   useEffect(() => {
@@ -183,6 +196,9 @@ export default function SonarRoom() {
       if (timerRef.current && phaseRef.current === 'playing') {
         timerRef.current.textContent = fmt(engine.elapsedMs)
       }
+      // Drop any held controls when the run ends so the player
+      // never keeps sliding into the dark after death.
+      if (phaseRef.current !== 'playing') resetJoy()
       raf = requestAnimationFrame(loop)
     }
     raf = requestAnimationFrame(loop)
@@ -230,7 +246,7 @@ export default function SonarRoom() {
       window.clearTimeout(endDelayRef.current)
       audio.dispose()
     }
-  }, [handleEnd, loadEscapes, showToast, startGame])
+  }, [handleEnd, loadEscapes, resetJoy, showToast, startGame])
 
   // ------------------------------------------------------------- pointer
   const onCanvasPointerDown = (e: React.PointerEvent) => {
@@ -241,13 +257,22 @@ export default function SonarRoom() {
     }
   }
 
+  // ------------------------------------------------------------- joystick
   const onJoyDown = (e: React.PointerEvent) => {
     e.stopPropagation()
+    e.preventDefault()
     setTouchMode(true)
-    const rect = e.currentTarget.getBoundingClientRect()
+    const el = e.currentTarget
+    const rect = el.getBoundingClientRect()
     joyCenterRef.current = { x: rect.left + rect.width / 2, y: rect.top + rect.height / 2 }
     joyIdRef.current = e.pointerId
-    ;(e.target as HTMLElement).setPointerCapture(e.pointerId)
+    // Capture on the pad itself so the drag keeps tracking even when the
+    // finger slides off it, and the browser cannot steal the gesture.
+    try {
+      el.setPointerCapture(e.pointerId)
+    } catch {
+      /* very old browsers */
+    }
     updateJoy(e)
   }
   const onJoyMove = (e: React.PointerEvent) => {
@@ -258,9 +283,13 @@ export default function SonarRoom() {
   const onJoyUp = (e: React.PointerEvent) => {
     if (joyIdRef.current !== e.pointerId) return
     e.stopPropagation()
-    joyIdRef.current = null
-    joyRef.current = { x: 0, y: 0, active: false }
-    if (knobRef.current) knobRef.current.style.transform = 'translate(-50%, -50%)'
+    resetJoy()
+  }
+  // Safety net: if the browser steals the pointer mid-drag (gesture,
+  // notification, palm rejection) the stick must not stay stuck.
+  const onJoyLostCapture = (e: React.PointerEvent) => {
+    if (joyIdRef.current !== e.pointerId) return
+    resetJoy()
   }
   const updateJoy = (e: React.PointerEvent) => {
     const dx = e.clientX - joyCenterRef.current.x
@@ -268,9 +297,17 @@ export default function SonarRoom() {
     const max = 44
     const d = Math.hypot(dx, dy)
     const k = d > max ? max / d : 1
-    joyRef.current = { x: (dx * k) / max, y: (dy * k) / max, active: true }
+    // Deadzone: ignore finger jitter near the center, then remap the
+    // remaining travel so a firm push always means full speed.
+    const DEAD = 0.18
+    const v = Math.min(1, d / max)
+    const mag = v < DEAD ? 0 : Math.min(1, (v - DEAD) / (1 - DEAD))
+    const n = d || 1
+    joyRef.current = { x: (dx / n) * mag, y: (dy / n) * mag, active: mag > 0 }
     if (knobRef.current) {
-      knobRef.current.style.transform = `translate(calc(-50% + ${joyRef.current.x * 40}px), calc(-50% + ${joyRef.current.y * 40}px))`
+      const kx = dx * k
+      const ky = dy * k
+      knobRef.current.style.transform = `translate(calc(-50% + ${kx}px), calc(-50% + ${ky}px))`
     }
   }
 
@@ -279,7 +316,7 @@ export default function SonarRoom() {
   return (
     <div
       ref={wrapRef}
-      className="fixed inset-0 select-none overflow-hidden bg-black font-mono text-white"
+      className="fixed inset-0 select-none overflow-hidden overscroll-none bg-black font-mono text-white"
     >
       <style>{`
         @keyframes sonar-ring {
@@ -304,6 +341,10 @@ export default function SonarRoom() {
           93% { opacity: 0.4; }
           94% { opacity: 1; }
           97% { opacity: 0.7; }
+        }
+        button {
+          touch-action: manipulation;
+          -webkit-tap-highlight-color: transparent;
         }
       `}</style>
 
@@ -341,10 +382,22 @@ export default function SonarRoom() {
           </div>
           {/* Hint */}
           <div
-            className="absolute bottom-8 left-1/2 -translate-x-1/2 text-center text-[10px] tracking-[0.3em] text-white/50 sm:text-xs"
+            className={`absolute left-1/2 -translate-x-1/2 text-center text-[10px] text-white/50 sm:text-xs ${
+              touchMode ? 'bottom-48 tracking-[0.2em]' : 'bottom-8 tracking-[0.3em] sm:tracking-[0.3em]'
+            }`}
             style={{ animation: 'hint-fade 9s ease-out forwards' }}
           >
-            CLICK / SPACE — PING&nbsp;&nbsp;·&nbsp;&nbsp;W A S D — MOVE
+            {touchMode ? (
+              <>
+                TAP — PING
+                <br />
+                STICK — MOVE
+              </>
+            ) : (
+              <>
+                CLICK / SPACE — PING&nbsp;&nbsp;·&nbsp;&nbsp;W A S D — MOVE
+              </>
+            )}
             <br />
             <span className="text-white/30">EVERY SOUND ECHOES. IT LISTENS.</span>
           </div>
@@ -363,14 +416,16 @@ export default function SonarRoom() {
       {/* ---------------- Touch joystick ---------------- */}
       {playing && touchMode && (
         <div
-          className="absolute bottom-8 left-6 z-20 h-32 w-32 rounded-full border border-white/20 bg-white/[0.02]"
+          className="absolute bottom-3 left-2 z-20 flex h-44 w-44 touch-none select-none items-center justify-center rounded-full sm:bottom-6 sm:left-5"
           onPointerDown={onJoyDown}
           onPointerMove={onJoyMove}
           onPointerUp={onJoyUp}
           onPointerCancel={onJoyUp}
+          onLostPointerCapture={onJoyLostCapture}
           aria-label="Movement joystick"
           role="application"
         >
+          <div className="pointer-events-none h-32 w-32 rounded-full border border-white/20 bg-white/[0.02]" />
           <div
             ref={knobRef}
             className="pointer-events-none absolute left-1/2 top-1/2 h-12 w-12 -translate-x-1/2 -translate-y-1/2 rounded-full border border-white/40 bg-white/10 transition-transform duration-75"
@@ -408,11 +463,11 @@ export default function SonarRoom() {
 
           <div className="mb-10 w-full max-w-sm space-y-2.5 border border-white/10 p-5 text-[11px] tracking-[0.2em] text-white/60">
             <div className="flex items-center justify-between gap-4">
-              <span className="text-white/85">CLICK / SPACE</span>
+              <span className="text-white/85">{touchMode ? 'TAP SCREEN' : 'CLICK / SPACE'}</span>
               <span>EMIT SONAR PING</span>
             </div>
             <div className="flex items-center justify-between gap-4">
-              <span className="text-white/85">W A S D</span>
+              <span className="text-white/85">{touchMode ? 'LEFT STICK' : 'W A S D'}</span>
               <span>MOVE</span>
             </div>
             <div className="flex items-center justify-between gap-4">
