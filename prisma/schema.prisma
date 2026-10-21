@@ -1,0 +1,21 @@
+// Prisma schema for The Sonar Room.
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "sqlite"
+  url      = env("DATABASE_URL")
+}
+
+model Run {
+  id        String   @id @default(cuid())
+  outcome   String // "escaped" | "caught"
+  timeMs    Int // run duration in milliseconds
+  keysFound Int // 0..3
+  pings     Int // number of sonar pings used
+  createdAt DateTime @default(now())
+
+  @@index([outcome, timeMs])
+}
