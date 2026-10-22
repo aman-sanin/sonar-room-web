@@ -3,7 +3,7 @@
 // THE SONAR ROOM — you are blind. Click to ping, WASD to move.
 // The screen is 90% black; the world only exists where sound has touched it.
 
-import { useCallback, useEffect, useRef, useState } from 'react'
+import { useCallback, useEffect, useRef, useState, useSyncExternalStore } from 'react'
 import { SonarEngine, RunResult } from '@/lib/game/engine'
 import { SoundEngine } from '@/lib/game/audio'
 
@@ -24,7 +24,27 @@ function fmt(ms: number): string {
   return `${String(m).padStart(2, '0')}:${String(s % 60).padStart(2, '0')}`
 }
 
+const emptySubscribe = () => () => {}
+
 export default function SonarRoom() {
+  // Browser extensions (Dark Reader, Grammarly, translators…) inject <style>
+  // and attribute mutations into the DOM before React hydrates, which breaks
+  // structural hydration matching. The game is a pure client-side canvas +
+  // WebAudio experience, so the server only needs to paint the black room.
+  // Hydrate a minimal, trivially-matchable shell first, then mount the real
+  // game once we know we are on the client.
+  const hydrated = useSyncExternalStore(
+    emptySubscribe,
+    () => true,
+    () => false,
+  )
+  if (!hydrated) {
+    return <div className="fixed inset-0 bg-black" suppressHydrationWarning />
+  }
+  return <SonarRoomGame />
+}
+
+function SonarRoomGame() {
   const canvasRef = useRef<HTMLCanvasElement | null>(null)
   const wrapRef = useRef<HTMLDivElement | null>(null)
   const engineRef = useRef<SonarEngine | null>(null)
@@ -318,36 +338,6 @@ export default function SonarRoom() {
       ref={wrapRef}
       className="fixed inset-0 select-none overflow-hidden overscroll-none bg-black font-mono text-white"
     >
-      <style>{`
-        @keyframes sonar-ring {
-          0% { transform: translate(-50%,-50%) scale(0.08); opacity: 0.7; }
-          100% { transform: translate(-50%,-50%) scale(1.6); opacity: 0; }
-        }
-        @keyframes hint-fade {
-          0% { opacity: 0; }
-          8% { opacity: 1; }
-          70% { opacity: 1; }
-          100% { opacity: 0; }
-        }
-        @keyframes toast-in {
-          0% { opacity: 0; letter-spacing: 0.9em; }
-          15% { opacity: 1; }
-          80% { opacity: 1; }
-          100% { opacity: 0; }
-        }
-        @keyframes flicker {
-          0%, 100% { opacity: 1; }
-          92% { opacity: 1; }
-          93% { opacity: 0.4; }
-          94% { opacity: 1; }
-          97% { opacity: 0.7; }
-        }
-        button {
-          touch-action: manipulation;
-          -webkit-tap-highlight-color: transparent;
-        }
-      `}</style>
-
       <canvas
         ref={canvasRef}
         aria-label="The Sonar Room — echolocation game canvas"

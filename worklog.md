@@ -42,3 +42,19 @@ Stage Summary:
 - Mobile joystick fully functional: visible from game start on touch devices, immune to browser gesture theft (touch-action none + capture + lost-capture reset), deadzone + full-speed curve, auto-reset on death/win/blur.
 - Desktop/keyboard paths unchanged and re-verified; lint clean; temp debug handle removed.
 - Files touched: src/components/sonar-room.tsx, src/app/layout.tsx (Viewport export only).
+
+---
+Task ID: 3
+Agent: AI Assistant (main)
+Task: Fix "Hydration failed because the server rendered HTML didn't match the client" (darkreader darkreader--sync style node found where <canvas> was expected).
+
+Work Log:
+- Root cause: the game SSR'd its full interactive tree and rendered an inline <style> element; extensions like Dark Reader patch that <style> and inject their own <style class="darkreader darkreader--sync"> siblings before React hydrates, so React met an unexpected node where it expected <canvas>.
+- Fix 1 (src/app/globals.css): moved all game keyframes (sonar-ring, hint-fade, toast-in, flicker) and the button touch-action/tap-highlight rules out of the component's inline <style> into globals.css — the component tree no longer contains any <style> element.
+- Fix 2 (src/components/sonar-room.tsx): split the component. New default export SonarRoom is a hydration gate using useSyncExternalStore(emptySubscribe, () => true, () => false): SSR + first client render emit a trivial <div class="fixed inset-0 bg-black" suppressHydrationWarning> shell; the full game (SonarRoomGame, unchanged internals) mounts only after hydration. Extension noise therefore cannot desync the hydrated tree, and the bootstrap effect still runs with the canvas present. Hoisted emptySubscribe above first use for the react-hooks/immutability rule.
+- Verified: lint clean; SSR HTML for / now contains only the bare black shell (no canvas/menu/inline style); browser reload shows zero console/page errors, menu renders post-hydration, computed animationName confirms globals.css keyframes load; simulated a darkreader--sync injection + attribute noise → BEGIN → canvas ping reveals maze walls normally; iPhone emulation regression: joystick appears immediately with touch-action none and touch hint.
+- Cost/tradeoff: pre-hydration first paint is now a pure black screen (thematically consistent — the room is dark until you arrive); SEO/crawlers see the shell, acceptable for a canvas game.
+
+Stage Summary:
+- Hydration mismatch from browser extensions eliminated structurally (minimal SSR shell + hydration gate + zero inline <style> in the tree).
+- Files touched: src/components/sonar-room.tsx, src/app/globals.css. Mobile joystick behavior from Task 2 re-verified intact.

@@ -120,3 +120,41 @@
     @apply bg-background text-foreground;
   }
 }
+
+/* ------------------------------------------------------------------ */
+/* The Sonar Room — global styles (kept out of the component tree so  */
+/* browser extensions that inject <style> nodes, e.g. Dark Reader,    */
+/* cannot break React hydration).                                     */
+/* ------------------------------------------------------------------ */
+
+@keyframes sonar-ring {
+  0% { transform: translate(-50%,-50%) scale(0.08); opacity: 0.7; }
+  100% { transform: translate(-50%,-50%) scale(1.6); opacity: 0; }
+}
+
+@keyframes hint-fade {
+  0% { opacity: 0; }
+  8% { opacity: 1; }
+  70% { opacity: 1; }
+  100% { opacity: 0; }
+}
+
+@keyframes toast-in {
+  0% { opacity: 0; letter-spacing: 0.9em; }
+  15% { opacity: 1; }
+  80% { opacity: 1; }
+  100% { opacity: 0; }
+}
+
+@keyframes flicker {
+  0%, 100% { opacity: 1; }
+  92% { opacity: 1; }
+  93% { opacity: 0.4; }
+  94% { opacity: 1; }
+  97% { opacity: 0.7; }
+}
+
+button {
+  touch-action: manipulation;
+  -webkit-tap-highlight-color: transparent;
+}
