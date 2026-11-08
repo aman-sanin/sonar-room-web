@@ -300,11 +300,12 @@ function SonarRoomGame() {
     const audio = new SoundEngine()
     audioRef.current = audio
     const engine = new SonarEngine(audio, {
-      onKeys: (c) => {
+      onKeys: (c, takenIndex) => {
         setKeyCounts(c)
         if (mpActiveRef.current) {
           netRef.current?.emit('hunt:evt', {
             t: 'keys',
+            i: takenIndex ?? -1,
             crimson: c.crimson,
             jade: c.jade,
           } satisfies HuntEvt)
@@ -379,6 +380,10 @@ function SonarRoomGame() {
           break
         }
         case 'keys': {
+          // Retire the exact key from this side's world too — otherwise the
+          // hunter keeps re-revealing keys that are already in the prey's
+          // pocket. Index matches because both maps come from the same seed.
+          engine.netKeyTaken(e.i, e.crimson, e.jade)
           setKeyCounts({ total: e.crimson + e.jade, crimson: e.crimson, jade: e.jade })
           if (e.crimson === 3 || e.jade === 3) {
             showToast(`THE PREY CAN OPEN THE ${e.crimson === 3 ? 'CRIMSON' : 'JADE'} DOOR`)

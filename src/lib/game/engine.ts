@@ -33,7 +33,8 @@ export interface RunResult {
 }
 
 export interface EngineHooks {
-  onKeys?: (c: KeyCounts) => void
+  /** `takenIndex` is the grabbed key's index in the shared key list (-1 none). */
+  onKeys?: (c: KeyCounts, takenIndex?: number) => void
   onToast?: (msg: string) => void
   onEnd?: (r: RunResult) => void
   /** Multiplayer: events the engine asks the component to relay to the peer. */
@@ -459,7 +460,8 @@ export class SonarEngine {
   }
 
   private updateKeys(dt: number): void {
-    for (const k of this.keys) {
+    for (let ki = 0; ki < this.keys.length; ki++) {
+      const k = this.keys[ki]
       if (k.found) continue
       const d = Math.hypot(this.player.x - k.x, this.player.y - k.y)
       // Faint jingle hints when a key is close by.
@@ -473,7 +475,7 @@ export class SonarEngine {
         this.keysFound++
         this.audio.chime(this.panOf(k.x), 0.5)
         const counts = this.counts()
-        this.hooks.onKeys?.(counts)
+        this.hooks.onKeys?.(counts, ki)
         if (this.mode === 'solo') {
           if (this.keysFound >= 3) {
             const d0 = this.doorState[0]
@@ -875,6 +877,24 @@ export class SonarEngine {
     const d = Math.hypot(this.player.x - x, this.player.y - y)
     this.audio.pingHeard(this.panOf(x), 0.3 + 0.7 * this.volByDist(d, 900))
     this.pings.push(this.makePing(x, y, 0, PING_MAX_R, PING_SPEED))
+  }
+
+  /**
+   * Hunter side: the prey grabbed a key — retire that exact key from our
+   * world too, or our pings keep re-revealing a key that is already gone.
+   * The tally arrives authoritative from the survivor's client.
+   */
+  netKeyTaken(i: number, crimson: number, jade: number): void {
+    if (this.phase !== 'playing') return
+    const k = i >= 0 ? this.keys[i] : undefined
+    if (k && !k.found) {
+      k.found = true
+      // Everything in this room is sound: the pickup itself rings out from
+      // where it happened, so the hunter can guess where the prey just stood.
+      const d = Math.hypot(this.player.x - k.x, this.player.y - k.y)
+      this.audio.chime(this.panOf(k.x), 0.05 + 0.22 * this.volByDist(d, 720))
+    }
+    this.keysFound = crimson + jade
   }
 
   /** Hunter side: the prey is working a lock — hear it, and the door burns. */

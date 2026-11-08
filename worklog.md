@@ -92,3 +92,20 @@ Work Log:
 Stage Summary:
 - Hunt mode now plays as a heist: two exits on opposite ends of the maze, each sealed until the prey finds its 3 matching colored keys (spawned on the far side, forcing crossings) and then stands vulnerable at the door for a full 3-second channel that resets if interrupted — while a human hunter, blind but listening, hears the lock rattle in stereo and races to defend it.
 - Files touched: src/lib/game/maze.ts, src/lib/game/net.ts, src/lib/game/engine.ts, src/lib/game/audio.ts, src/components/sonar-room.tsx. Lint + tsc clean; solo untouched; room-service unchanged (verbatim relay).
+
+---
+Task ID: 6
+Agent: AI Assistant (main)
+Task: Fix — keys taken by the survivor never disappeared from the monster's view (every later ping/click kept re-revealing already-collected keys).
+
+Work Log:
+- Root cause: the `keys` net event carried only per-color tallies, and the hunter-side handler only updated the HUD chips + toast — it never told the hunter's engine anything. Since updateKeys() does not run in hunter mode (the survivor's client is authoritative), the hunter's KeyItem.found flags stayed false forever, so updatePings() and the render loop kept revealing collected keys on every shared wavefront.
+- Protocol (src/lib/game/net.ts): `keys` event extended with `i` — the taken key's index in the shared map's key list. Safe because both clients build identical key arrays from the same seed (mulberry32, verified deterministic).
+- Engine (src/lib/game/engine.ts): EngineHooks.onKeys gained an optional `takenIndex` param (updateKeys now iterates by index and passes the grabbed key's index; the start() reset call emits undefined → -1 on the wire, which also re-syncs a fresh run's tally). New netKeyTaken(i, crimson, jade) on the hunter path: marks that exact key found (render + reveal loops skip it), sets keysFound from the authoritative tally, and plays a distance-attenuated, panned chime at the key's position — in a sound-only game the pickup itself is a audible clue about where the prey just stood.
+- Component (src/components/sonar-room.tsx): onKeys hook relays the index; hunter's `case 'keys'` now calls engine.netKeyTaken(...) before updating HUD/toast.
+- E2E verified with a scripted survivor peer (tests/fake-survivor.ts, kept in-tree) against the real hunter client in agent-browser through the gateway (:81 — XTransformPort never reaches the room service on direct :3000; the earlier "NO SUCH ROOM" mystery was the UI correctly reporting a room whose host had been reaped by the shell harness between tool calls). Seed-searched map so two keys sit within 280px of the hunter spawn (on-camera): survivor ping at key[1] → crimson diamond visible in hunter's view; `keys {i:1}` → second ping at the SAME spot → diamond gone, HUD CRIMSON 1/3; third ping elsewhere swept the taken key's position again → still hidden, while untaken keys (0,2,4,5) revealed normally in both shots. Retirement persists across pings; solo path untouched. Two test-harness gotchas documented in the peer script: a ping emitted exactly AT a key never reveals it (reveal band is an expanding annulus d<=r && d>rPrev, so the origin is offset 35px) and backgrounded peer processes are reaped between tool calls (peer must live inside a single Bash call).
+- TEMP window.__netProbe debug handle added for connection diagnosis and removed after verification; lint + tsc clean; solo smoke test after cleanup: zero console errors.
+
+Stage Summary:
+- Key state is now a properly shared physical fact: when the prey pockets a key it vanishes from the hunter's world too — with a spatialized chime marking the spot. The hunter's mental map of which keys remain (and therefore which door is still reachable) stays truthful.
+- Files touched: src/lib/game/net.ts, src/lib/game/engine.ts, src/components/sonar-room.tsx (+ tests/fake-survivor.ts as a reusable MP harness).

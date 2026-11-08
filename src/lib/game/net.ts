@@ -25,8 +25,12 @@ export type HuntEvt =
   | { t: 'ping'; x: number; y: number }
   /** The hunter's echolocation click — jagged, dim reveal for both. */
   | { t: 'click'; x: number; y: number }
-  /** Survivor grabbed a key — per-color tallies (3 of a color opens that door). */
-  | { t: 'keys'; crimson: number; jade: number }
+  /**
+   * Survivor grabbed a key. `i` is the taken key's index in the shared
+   * map's key list (identical on both clients — placement is seeded), so
+   * the hunter can retire the exact key. Counts are the authoritative tally.
+   */
+  | { t: 'keys'; i: number; crimson: number; jade: number }
   /**
    * The survivor is working a door's lock (3-second channel). Emitted when
    * progress moves in 1/8th steps, on unlock, and on interrupt. Both sides
