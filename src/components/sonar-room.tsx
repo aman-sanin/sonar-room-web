@@ -4,10 +4,15 @@
 // The screen is 90% black; the world only exists where sound has touched it.
 
 import { useCallback, useEffect, useRef, useState, useSyncExternalStore } from 'react'
+import { io, type Socket } from 'socket.io-client'
 import { SonarEngine, RunResult } from '@/lib/game/engine'
 import { SoundEngine } from '@/lib/game/audio'
+import type { Role, ReadyPayload, HuntEvt, CreateAck, JoinAck } from '@/lib/game/net'
+
+const ROOM_SERVICE_PORT = 3003
 
 type Phase = 'menu' | 'playing' | 'dead' | 'win'
+type MpStage = 'off' | 'choose' | 'pick' | 'join' | 'lobby'
 
 interface Escape {
   timeMs: number
@@ -58,6 +63,15 @@ function SonarRoomGame() {
   const knobRef = useRef<HTMLDivElement | null>(null)
   const toastTimeoutRef = useRef<number>(0)
   const endDelayRef = useRef<number>(0)
+  const netRef = useRef<Socket | null>(null)
+  const roleRef = useRef<Role | null>(null)
+  const isHostRef = useRef(false)
+  const mpStageRef = useRef<MpStage>('off')
+  const mpActiveRef = useRef(false)
+  const iWantRef = useRef(false)
+  const peerWantsRef = useRef(false)
+  const peerLinkedRef = useRef(false)
+  const startTimerRef = useRef<number>(0)
 
   const [phase, setPhaseState] = useState<Phase>('menu')
   const [keysFound, setKeysFound] = useState(0)
@@ -67,6 +81,22 @@ function SonarRoomGame() {
   const [escapes, setEscapes] = useState<Escape[]>([])
   const [touchMode, setTouchMode] = useState(false)
   const [menuVisible, setMenuVisible] = useState(true)
+  const [mpStage, setMpStage] = useState<MpStage>('off')
+  const [role, setRole] = useState<Role | null>(null)
+  const [roomCode, setRoomCode] = useState<string | null>(null)
+  const [mpStatus, setMpStatus] = useState('')
+  const [mpError, setMpError] = useState('')
+  const [joinInput, setJoinInput] = useState('')
+  const [peerLinked, setPeerLinked] = useState(false)
+  const [peerLost, setPeerLost] = useState(false)
+  const [iWant, setIWant] = useState(false)
+  const [peerWants, setPeerWants] = useState(false)
+  const [copied, setCopied] = useState(false)
+
+  const setMpStageBoth = useCallback((s: MpStage) => {
+    mpStageRef.current = s
+    setMpStage(s)
+  }, [])
 
   const setPhase = useCallback((p: Phase) => {
     phaseRef.current = p
@@ -98,7 +128,7 @@ function SonarRoomGame() {
   }, [])
 
   const handleEnd = useCallback(
-    (r: RunResult) => {
+    (r: RunResult, mp = false) => {
       setResult(r)
       // Let the death flash / win tone breathe before the overlay lands.
       window.clearTimeout(endDelayRef.current)
@@ -106,6 +136,18 @@ function SonarRoomGame() {
         setPhase(r.outcome === 'escaped' ? 'win' : 'dead')
         setMenuVisible(true)
       }, r.outcome === 'escaped' ? 700 : 1100)
+      if (mp) {
+        // Multiplayer runs are not comparable with solo times — share the
+        // verdict with the hunter instead of the leaderboard.
+        netRef.current?.emit('hunt:evt', {
+          t: 'end',
+          outcome: r.outcome,
+          timeMs: r.timeMs,
+          keysFound: r.keysFound,
+          pings: r.pings,
+        } satisfies HuntEvt)
+        return
+      }
       // Persist.
       try {
         if (r.outcome === 'escaped') {
@@ -130,7 +172,7 @@ function SonarRoomGame() {
     [loadEscapes, setPhase],
   )
 
-  const startGame = useCallback(() => {
+  const startGame = useCallback((seed?: number) => {
     const audio = audioRef.current
     const engine = engineRef.current
     if (!audio || !engine) return
@@ -139,6 +181,16 @@ function SonarRoomGame() {
     const coarse = window.matchMedia?.('(pointer: coarse)').matches ?? false
     const touchable = (navigator.maxTouchPoints ?? 0) > 0 || 'ontouchstart' in window
     if (coarse || touchable) setTouchMode(true)
+    // Multiplayer: role decides who simulates what. Solo: vs the AI thing.
+    const mp = mpActiveRef.current || (mpStageRef.current === 'lobby' && roleRef.current !== null)
+    mpActiveRef.current = mp
+    engine.mode = mp ? (roleRef.current === 'monster' ? 'hunter' : 'host') : 'solo'
+    iWantRef.current = false
+    peerWantsRef.current = false
+    setIWant(false)
+    setPeerWants(false)
+    setPeerLost(false)
+    setMpStageBoth('off')
     audio.ensure()
     window.clearTimeout(endDelayRef.current)
     resetJoy()
@@ -146,20 +198,204 @@ function SonarRoomGame() {
     setKeysFound(0)
     setToast(null)
     setMenuVisible(false)
-    engine.start()
+    engine.start(seed ?? Math.floor(Math.random() * 1e9))
     setPhase('playing')
-  }, [resetJoy, setPhase])
+  }, [resetJoy, setPhase, setMpStageBoth])
+
+  // --------------------------------------------------------- multiplayer
+  const exitMp = useCallback(() => {
+    netRef.current?.emit('hunt:leave')
+    roleRef.current = null
+    isHostRef.current = false
+    mpActiveRef.current = false
+    iWantRef.current = false
+    peerWantsRef.current = false
+    setRole(null)
+    setRoomCode(null)
+    setMpStatus('')
+    setMpError('')
+    setPeerLinked(false)
+    setPeerLost(false)
+    setIWant(false)
+    setPeerWants(false)
+    setJoinInput('')
+    setMpStageBoth('off')
+    setPhase('menu')
+    setMenuVisible(true)
+  }, [setPhase, setMpStageBoth])
+
+  const beginCreate = useCallback(
+    (r: Role) => {
+      setMpError('')
+      roleRef.current = r
+      setRole(r)
+      isHostRef.current = true
+      const socket = netRef.current
+      if (!socket) return
+      socket.emit('hunt:create', { role: r }, (ack: CreateAck) => {
+        if (ack?.ok && ack.code) {
+          setRoomCode(ack.code)
+          setMpStatus('WAITING IN THE DARK — SHARE THE CODE')
+          setMpStageBoth('lobby')
+        } else {
+          setMpError(ack?.error ?? 'THE DEEP IS SILENT — TRY AGAIN')
+        }
+      })
+    },
+    [],
+  )
+
+  const doJoin = useCallback(() => {
+    setMpError('')
+    const socket = netRef.current
+    if (!socket) return
+    socket.emit('hunt:join', { code: joinInput }, (ack: JoinAck) => {
+      if (ack?.ok && ack.code && ack.role) {
+        roleRef.current = ack.role
+        setRole(ack.role)
+        isHostRef.current = false
+        setRoomCode(ack.code)
+        setMpStatus('FOUND THEM — LINKING…')
+        setMpStageBoth('lobby')
+      } else {
+        setMpError(ack?.error ?? 'NO ANSWER — TRY AGAIN')
+      }
+    })
+  }, [joinInput])
+
+  const requestRematch = useCallback(() => {
+    if (!mpActiveRef.current) {
+      startGame()
+      return
+    }
+    iWantRef.current = true
+    setIWant(true)
+    netRef.current?.emit('hunt:evt', { t: 'rematch' } satisfies HuntEvt)
+    if (peerWantsRef.current && isHostRef.current) {
+      const seed = Math.floor(Math.random() * 1e9)
+      netRef.current?.emit('hunt:evt', { t: 'start', seed } satisfies HuntEvt)
+      startGame(seed)
+    }
+  }, [startGame])
 
   // ------------------------------------------------------------ bootstrap
   useEffect(() => {
     const audio = new SoundEngine()
     audioRef.current = audio
     const engine = new SonarEngine(audio, {
-      onKeys: setKeysFound,
+      onKeys: (n) => {
+        setKeysFound(n)
+        if (mpActiveRef.current) {
+          netRef.current?.emit('hunt:evt', { t: 'keys', n } satisfies HuntEvt)
+        }
+      },
       onToast: showToast,
-      onEnd: handleEnd,
+      onEnd: (r) => handleEnd(r, mpActiveRef.current),
+      onEmit: (e) => netRef.current?.emit('hunt:evt', e as HuntEvt),
     })
     engineRef.current = engine
+
+    // Room service — pairs the two devices and relays game events.
+    const socket = io(`/?XTransformPort=${ROOM_SERVICE_PORT}`, {
+      transports: ['websocket', 'polling'],
+      reconnection: true,
+      reconnectionAttempts: Infinity,
+      reconnectionDelay: 1000,
+      timeout: 10000,
+    })
+    netRef.current = socket
+
+    socket.on('connect', () => {
+      if (mpStageRef.current === 'lobby' && !peerLinkedRef.current) {
+        setMpStatus((s) => (s.startsWith('SIGNAL') ? 'CONTACTING THE DEEP…' : s))
+      }
+    })
+    socket.on('hunt:ready', (p: ReadyPayload) => {
+      roleRef.current = p.myRole
+      setRole(p.myRole)
+      setPeerLinked(true)
+      peerLinkedRef.current = true
+      setMpStatus('LINKED — DESCENDING…')
+      showToast(p.myRole === 'monster' ? 'THE PREY HAS DESCENDED' : 'THE HUNTER IS LISTENING')
+      if (isHostRef.current) {
+        // The creator's client chooses the shared seed and starts the run.
+        window.clearTimeout(startTimerRef.current)
+        startTimerRef.current = window.setTimeout(() => {
+          const seed = Math.floor(Math.random() * 1e9)
+          socket.emit('hunt:evt', { t: 'start', seed } satisfies HuntEvt)
+          startGame(seed)
+        }, 1500)
+      }
+    })
+    socket.on('hunt:evt', (e: HuntEvt) => {
+      if (!e || typeof e !== 'object') return
+      switch (e.t) {
+        case 'start': {
+          if (phaseRef.current !== 'playing') startGame(e.seed)
+          break
+        }
+        case 'pos': {
+          if (roleRef.current === 'monster') engine.setRemoteSurvivor(e.x, e.y, e.moving)
+          else engine.setRemoteMonster(e.x, e.y, e.moving)
+          break
+        }
+        case 'ping': {
+          if (roleRef.current === 'monster') engine.netSurvivorPing(e.x, e.y)
+          break
+        }
+        case 'click': {
+          if (roleRef.current === 'survivor') engine.netMonsterClick(e.x, e.y)
+          break
+        }
+        case 'keys': {
+          setKeysFound(e.n)
+          if (e.n >= 3) {
+            audio.unlock()
+            showToast('THE DOOR IS OPEN — STOP THEM')
+          } else {
+            showToast(`THE PREY FOUND A KEY — ${e.n}/3`)
+          }
+          break
+        }
+        case 'end': {
+          // The survivor's client is authoritative — this verdict is final.
+          const iAmHunter = roleRef.current === 'monster'
+          const won = iAmHunter ? e.outcome === 'caught' : e.outcome === 'escaped'
+          audio.setDanger(0)
+          audio.setExitHum(0)
+          if (e.outcome === 'caught') audio.win()
+          else audio.death()
+          window.clearTimeout(endDelayRef.current)
+          setResult({ outcome: e.outcome, timeMs: e.timeMs, keysFound: e.keysFound, pings: e.pings })
+          endDelayRef.current = window.setTimeout(() => {
+            setPhase(won ? 'win' : 'dead')
+            setMenuVisible(true)
+          }, 1100)
+          break
+        }
+        case 'rematch': {
+          peerWantsRef.current = true
+          setPeerWants(true)
+          showToast('THE OTHER SIDE WANTS A REMATCH')
+          if (iWantRef.current && isHostRef.current) {
+            const seed = Math.floor(Math.random() * 1e9)
+            socket.emit('hunt:evt', { t: 'start', seed } satisfies HuntEvt)
+            startGame(seed)
+          }
+          break
+        }
+        case 'peer-lost': {
+          peerLinkedRef.current = false
+          setPeerLinked(false)
+          if (phaseRef.current === 'playing') {
+            setPeerLost(true)
+          } else {
+            setMpStatus('YOUR PARTNER VANISHED INTO THE DARK')
+          }
+          break
+        }
+      }
+    })
 
     try {
       const b = window.localStorage.getItem(BEST_KEY)
@@ -185,6 +421,7 @@ function SonarRoomGame() {
 
     let raf = 0
     let last = performance.now()
+    let netFrame = 0
     const loop = (ts: number) => {
       const dt = Math.min(0.05, (ts - last) / 1000)
       last = ts
@@ -216,6 +453,23 @@ function SonarRoomGame() {
       if (timerRef.current && phaseRef.current === 'playing') {
         timerRef.current.textContent = fmt(engine.elapsedMs)
       }
+      // Stream the local body to the partner at ~15 Hz.
+      netFrame++
+      if (
+        mpActiveRef.current &&
+        phaseRef.current === 'playing' &&
+        netFrame % 4 === 0 &&
+        netRef.current?.connected
+      ) {
+        const p = engine.playerPos
+        const moving = Math.hypot(engine.input.x, engine.input.y) > 0.08
+        netRef.current.emit('hunt:evt', {
+          t: 'pos',
+          x: Math.round(p.x * 10) / 10,
+          y: Math.round(p.y * 10) / 10,
+          moving,
+        } satisfies HuntEvt)
+      }
       // Drop any held controls when the run ends so the player
       // never keeps sliding into the dark after death.
       if (phaseRef.current !== 'playing') resetJoy()
@@ -235,12 +489,17 @@ function SonarRoomGame() {
       keysStateRef.current.add(e.key === ' ' ? 'space' : e.key.toLowerCase())
       const k = e.key.toLowerCase()
       if (e.code === 'Space' || e.key === ' ' || k === 'enter') {
-        if (phaseRef.current === 'menu') startGame()
-        else if (phaseRef.current === 'playing') engine.ping()
-        else startGame()
+        if (phaseRef.current === 'menu') {
+          if (mpStageRef.current === 'off') startGame()
+        } else if (phaseRef.current === 'playing') engine.ping()
+        else {
+          if (mpActiveRef.current) requestRematch()
+          else startGame()
+        }
       }
       if (k === 'r' && (phaseRef.current === 'dead' || phaseRef.current === 'win')) {
-        startGame()
+        if (mpActiveRef.current) requestRematch()
+        else startGame()
       }
     }
     const onKeyUp = (e: KeyboardEvent) => {
@@ -264,9 +523,11 @@ function SonarRoomGame() {
       window.removeEventListener('blur', onBlur)
       window.clearTimeout(toastTimeoutRef.current)
       window.clearTimeout(endDelayRef.current)
+      window.clearTimeout(startTimerRef.current)
+      socket.disconnect()
       audio.dispose()
     }
-  }, [handleEnd, loadEscapes, resetJoy, showToast, startGame])
+  }, [handleEnd, loadEscapes, requestRematch, resetJoy, showToast, startGame])
 
   // ------------------------------------------------------------- pointer
   const onCanvasPointerDown = (e: React.PointerEvent) => {
@@ -350,22 +611,32 @@ function SonarRoomGame() {
       {playing && (
         <div className="pointer-events-none absolute inset-0 z-10">
           {/* Keys */}
-          <div className="absolute left-4 top-4 flex items-center gap-3 sm:left-6 sm:top-6">
-            <span className="sr-only">Keys collected: {keysFound} of 3</span>
-            <div className="flex items-center gap-2" aria-hidden>
-              {[0, 1, 2].map((i) => (
-                <div
-                  key={i}
-                  className={`h-2.5 w-2.5 rotate-45 border transition-all duration-300 ${
-                    i < keysFound ? 'border-white bg-white shadow-[0_0_8px_rgba(255,255,255,0.8)]' : 'border-white/40'
-                  }`}
-                />
-              ))}
-            </div>
-            <span className="text-[10px] tracking-[0.35em] text-white/40">KEYS</span>
+          <div
+          className="absolute left-4 top-4 flex items-center gap-3 sm:left-6 sm:top-6"
+        >
+          <span className="sr-only">Keys collected: {keysFound} of 3</span>
+          <div className="flex items-center gap-2" aria-hidden>
+            {[0, 1, 2].map((i) => (
+              <div
+                key={i}
+                className={`h-2.5 w-2.5 rotate-45 border transition-all duration-300 ${
+                  i < keysFound ? 'border-white bg-white shadow-[0_0_8px_rgba(255,255,255,0.8)]' : 'border-white/40'
+                }`}
+              />
+            ))}
           </div>
-          {/* Timer */}
-          <div className="absolute right-4 top-4 sm:right-6 sm:top-6">
+          <span className="text-[10px] tracking-[0.35em] text-white/40">
+            {mpActiveRef.current && role === 'monster' ? 'PREY' : 'KEYS'}
+          </span>
+        </div>
+          {/* Timer + link status */}
+          <div className="absolute right-4 top-4 flex items-center gap-3 sm:right-6 sm:top-6">
+            {mpActiveRef.current && (
+              <span
+                aria-label={peerLinked ? 'Partner connected' : 'Partner disconnected'}
+                className={`h-1.5 w-1.5 rounded-full ${peerLinked ? 'bg-white/80' : 'animate-pulse bg-white/30'}`}
+              />
+            )}
             <span ref={timerRef} className="text-xs tracking-[0.3em] text-white/45">
               00:00
             </span>
@@ -379,13 +650,13 @@ function SonarRoomGame() {
           >
             {touchMode ? (
               <>
-                TAP — PING
+                TAP — {role === 'monster' && mpActiveRef.current ? 'CLICK' : 'PING'}
                 <br />
                 STICK — MOVE
               </>
             ) : (
               <>
-                CLICK / SPACE — PING&nbsp;&nbsp;·&nbsp;&nbsp;W A S D — MOVE
+                CLICK / SPACE — {role === 'monster' && mpActiveRef.current ? 'ECHOCLICK' : 'PING'}
               </>
             )}
             <br />
@@ -476,11 +747,175 @@ function SonarRoomGame() {
           </div>
 
           <button
-            onClick={startGame}
+            onClick={() => startGame()}
             className="border border-white/50 px-12 py-3.5 text-sm tracking-[0.5em] transition-colors duration-200 hover:bg-white hover:text-black focus:outline-none focus:ring-1 focus:ring-white"
           >
             BEGIN
           </button>
+
+          {mpStage === 'off' && (
+            <button
+              onClick={() => setMpStageBoth('choose')}
+              className="mt-4 border border-white/20 px-10 py-2.5 text-[11px] tracking-[0.45em] text-white/55 transition-colors duration-200 hover:border-white/60 hover:text-white focus:outline-none focus:ring-1 focus:ring-white/40"
+            >
+              HUNT · TWO PLAYERS
+            </button>
+          )}
+
+          {mpStage !== 'off' && (
+            <div className="mt-6 w-full max-w-sm border border-white/10 p-5 text-[11px] tracking-[0.25em]">
+              {mpStage === 'choose' && (
+                <>
+                  <p className="mb-4 text-center text-[10px] tracking-[0.4em] text-white/40">
+                    TWO DEVICES · ONE CODE · ONE SURVIVOR
+                  </p>
+                  <div className="flex flex-col gap-2">
+                    <button
+                      onClick={() => setMpStageBoth('pick')}
+                      className="border border-white/25 px-6 py-3 tracking-[0.35em] transition-colors duration-200 hover:border-white hover:bg-white hover:text-black"
+                    >
+                      CREATE A ROOM
+                    </button>
+                    <button
+                      onClick={() => setMpStageBoth('join')}
+                      className="border border-white/25 px-6 py-3 tracking-[0.35em] transition-colors duration-200 hover:border-white hover:bg-white hover:text-black"
+                    >
+                      JOIN A ROOM
+                    </button>
+                  </div>
+                  <button
+                    onClick={() => setMpStageBoth('off')}
+                    className="mt-4 w-full text-center text-[10px] tracking-[0.4em] text-white/30 hover:text-white/70"
+                  >
+                    BACK
+                  </button>
+                </>
+              )}
+
+              {mpStage === 'pick' && (
+                <>
+                  <p className="mb-4 text-center text-[10px] tracking-[0.4em] text-white/40">
+                    CHOOSE YOUR SIDE
+                  </p>
+                  <div className="flex flex-col gap-2">
+                    <button
+                      onClick={() => beginCreate('survivor')}
+                      className="border border-white/25 px-6 py-3 text-left transition-colors duration-200 hover:border-white hover:bg-white hover:text-black"
+                    >
+                      <span className="tracking-[0.35em]">THE PREY</span>
+                      <span className="block pt-1 text-[9px] tracking-[0.2em] opacity-60">
+                        FIND 3 KEYS · REACH THE DOOR · STAY QUIET
+                      </span>
+                    </button>
+                    <button
+                      onClick={() => beginCreate('monster')}
+                      className="border border-white/25 px-6 py-3 text-left transition-colors duration-200 hover:border-white hover:bg-white hover:text-black"
+                    >
+                      <span className="tracking-[0.35em]">THE HUNTER</span>
+                      <span className="block pt-1 text-[9px] tracking-[0.2em] opacity-60">
+                        BLIND TOO · TRACK THEIR PINGS AND FOOTSTEPS · KILL
+                      </span>
+                    </button>
+                  </div>
+                  <button
+                    onClick={() => setMpStageBoth('choose')}
+                    className="mt-4 w-full text-center text-[10px] tracking-[0.4em] text-white/30 hover:text-white/70"
+                  >
+                    BACK
+                  </button>
+                </>
+              )}
+
+              {mpStage === 'join' && (
+                <>
+                  <p className="mb-4 text-center text-[10px] tracking-[0.4em] text-white/40">
+                    ENTER THE ROOM CODE
+                  </p>
+                  <input
+                    value={joinInput}
+                    onChange={(e) =>
+                      setJoinInput(
+                        e.target.value.toUpperCase().replace(/[^A-Z0-9]/g, '').slice(0, 4),
+                      )
+                    }
+                    onKeyDown={(e) => {
+                      if (e.key === 'Enter') doJoin()
+                    }}
+                    placeholder="· · · ·"
+                    aria-label="Room code"
+                    className="w-full border border-white/25 bg-transparent px-4 py-3 text-center text-2xl tracking-[0.6em] text-white placeholder:text-white/20 focus:border-white focus:outline-none"
+                  />
+                  {mpError && (
+                    <p className="mt-3 text-center text-[10px] tracking-[0.3em] text-white/70">
+                      {mpError}
+                    </p>
+                  )}
+                  <button
+                    onClick={doJoin}
+                    disabled={joinInput.length !== 4}
+                    className="mt-3 w-full border border-white/25 px-6 py-3 tracking-[0.35em] transition-colors duration-200 hover:border-white hover:bg-white hover:text-black disabled:opacity-30 disabled:hover:bg-transparent disabled:hover:text-white"
+                  >
+                    DESCEND TOGETHER
+                  </button>
+                  <button
+                    onClick={() => setMpStageBoth('choose')}
+                    className="mt-4 w-full text-center text-[10px] tracking-[0.4em] text-white/30 hover:text-white/70"
+                  >
+                    BACK
+                  </button>
+                </>
+              )}
+
+              {mpStage === 'lobby' && (
+                <>
+                  <p className="text-center text-[10px] tracking-[0.4em] text-white/40">
+                    ROOM CODE
+                  </p>
+                  <p className="my-4 text-center text-4xl font-light tracking-[0.55em] text-white">
+                    {roomCode}
+                  </p>
+                  <button
+                    onClick={() => {
+                      if (!roomCode) return
+                      try {
+                        void navigator.clipboard?.writeText(roomCode)
+                        setCopied(true)
+                        window.setTimeout(() => setCopied(false), 1600)
+                      } catch {
+                        /* clipboard unavailable */
+                      }
+                    }}
+                    className="mx-auto block border border-white/20 px-6 py-2 text-[10px] tracking-[0.4em] text-white/60 transition-colors duration-200 hover:border-white/60 hover:text-white"
+                  >
+                    {copied ? 'COPIED' : 'COPY CODE'}
+                  </button>
+                  <p
+                    aria-live="polite"
+                    className={`mt-5 text-center text-[10px] leading-relaxed tracking-[0.3em] ${
+                      peerLinked ? 'text-white' : 'animate-pulse text-white/45'
+                    }`}
+                  >
+                    {mpStatus}
+                  </p>
+                  <p className="mt-3 text-center text-[9px] leading-relaxed tracking-[0.25em] text-white/30">
+                    {role === 'monster'
+                      ? 'YOU ARE THE HUNTER. YOU ARE BLIND TOO — TRACK THEIR PINGS.'
+                      : role === 'survivor'
+                        ? 'YOU ARE THE PREY. EVERY PING YOU MAKE BETRAYS YOU.'
+                        : ''}
+                  </p>
+                  {!peerLinked && (
+                    <button
+                      onClick={exitMp}
+                      className="mt-4 w-full text-center text-[10px] tracking-[0.4em] text-white/30 hover:text-white/70"
+                    >
+                      CANCEL
+                    </button>
+                  )}
+                </>
+              )}
+            </div>
+          )}
 
           <div className="mt-8 flex flex-col items-center gap-1.5 text-[10px] tracking-[0.25em] text-white/30">
             {best !== null && <span>BEST ESCAPE — {fmt(best)}</span>}
@@ -489,25 +924,66 @@ function SonarRoomGame() {
         </div>
       )}
 
+      {/* ---------------- PEER LOST (multiplayer) ---------------- */}
+      {peerLost && (
+        <div className="absolute inset-0 z-40 flex flex-col items-center justify-center bg-black/95 px-6">
+          <h2 className="mb-4 text-2xl font-light tracking-[0.5em] sm:text-3xl">
+            THE LINK IS SEVERED
+          </h2>
+          <p className="mb-10 text-center text-[11px] tracking-[0.3em] leading-relaxed text-white/50">
+            YOUR PARTNER VANISHED INTO THE DARK.
+          </p>
+          <button
+            onClick={exitMp}
+            className="border border-white/50 px-10 py-3 text-sm tracking-[0.45em] transition-colors duration-200 hover:bg-white hover:text-black focus:outline-none focus:ring-1 focus:ring-white"
+          >
+            BACK TO THE MENU
+          </button>
+        </div>
+      )}
+
       {/* ---------------- DEATH ---------------- */}
       {phase === 'dead' && result && (
         <div className="absolute inset-0 z-30 flex flex-col items-center justify-center bg-black/90 px-6">
           <h2 className="mb-6 text-3xl font-light tracking-[0.5em] sm:text-4xl">
-            IT FOUND YOU
+            {mpActiveRef.current && role === 'monster' ? 'THE PREY ESCAPED' : 'IT FOUND YOU'}
           </h2>
           <div className="mb-10 space-y-1.5 text-center text-[11px] tracking-[0.3em] text-white/50">
-            <p>ENDURED {fmt(result.timeMs)}</p>
+            {mpActiveRef.current && role === 'monster' ? (
+              <p>THE HUNT LASTED {fmt(result.timeMs)}</p>
+            ) : (
+              <p>ENDURED {fmt(result.timeMs)}</p>
+            )}
             <p>
               KEYS {result.keysFound}/3 · PINGS {result.pings}
             </p>
           </div>
-          <button
-            onClick={startGame}
-            className="border border-white/50 px-10 py-3 text-sm tracking-[0.45em] transition-colors duration-200 hover:bg-white hover:text-black focus:outline-none focus:ring-1 focus:ring-white"
-          >
-            TRY AGAIN
-          </button>
-          <p className="mt-5 text-[10px] tracking-[0.3em] text-white/25">PRESS R</p>
+          {mpActiveRef.current ? (
+            <>
+              <button
+                onClick={requestRematch}
+                className="border border-white/50 px-10 py-3 text-sm tracking-[0.45em] transition-colors duration-200 hover:bg-white hover:text-black focus:outline-none focus:ring-1 focus:ring-white"
+              >
+                {iWant && peerWants ? 'RESTARTING…' : iWant ? 'WAITING FOR YOUR PARTNER…' : 'REMATCH'}
+              </button>
+              <button
+                onClick={exitMp}
+                className="mt-4 text-[10px] tracking-[0.4em] text-white/30 transition-colors hover:text-white/70"
+              >
+                BACK TO THE MENU
+              </button>
+            </>
+          ) : (
+            <>
+              <button
+                onClick={() => startGame()}
+                className="border border-white/50 px-10 py-3 text-sm tracking-[0.45em] transition-colors duration-200 hover:bg-white hover:text-black focus:outline-none focus:ring-1 focus:ring-white"
+              >
+                TRY AGAIN
+              </button>
+              <p className="mt-5 text-[10px] tracking-[0.3em] text-white/25">PRESS R</p>
+            </>
+          )}
         </div>
       )}
 
@@ -515,19 +991,21 @@ function SonarRoomGame() {
       {phase === 'win' && result && (
         <div className="absolute inset-0 z-30 flex flex-col items-center justify-center overflow-y-auto bg-black/92 px-6 py-10">
           <h2 className="mb-2 text-3xl font-light tracking-[0.5em] sm:text-4xl">
-            YOU ESCAPED
+            {mpActiveRef.current && role === 'monster' ? 'PREY SLAIN' : 'YOU ESCAPED'}
           </h2>
           <p className="mb-8 text-xs tracking-[0.4em] text-white/50">
-            {fmt(result.timeMs)} · {result.pings} PINGS
+            {mpActiveRef.current && role === 'monster'
+              ? `THE HUNT LASTED ${fmt(result.timeMs)}`
+              : `${fmt(result.timeMs)} · ${result.pings} PINGS`}
           </p>
 
-          {best !== null && (
+          {!mpActiveRef.current && best !== null && (
             <p className="mb-8 text-[11px] tracking-[0.35em] text-white/70">
               BEST ESCAPE — {fmt(best)}
             </p>
           )}
 
-          {escapes.length > 0 && (
+          {!mpActiveRef.current && escapes.length > 0 && (
             <div className="mb-10 w-full max-w-xs border border-white/10 p-4">
               <p className="mb-3 text-center text-[10px] tracking-[0.4em] text-white/40">
                 FASTEST ESCAPES
@@ -544,13 +1022,32 @@ function SonarRoomGame() {
             </div>
           )}
 
-          <button
-            onClick={startGame}
-            className="border border-white/50 px-10 py-3 text-sm tracking-[0.45em] transition-colors duration-200 hover:bg-white hover:text-black focus:outline-none focus:ring-1 focus:ring-white"
-          >
-            DESCEND AGAIN
-          </button>
-          <p className="mt-5 text-[10px] tracking-[0.3em] text-white/25">PRESS R</p>
+          {mpActiveRef.current ? (
+            <>
+              <button
+                onClick={requestRematch}
+                className="border border-white/50 px-10 py-3 text-sm tracking-[0.45em] transition-colors duration-200 hover:bg-white hover:text-black focus:outline-none focus:ring-1 focus:ring-white"
+              >
+                {iWant && peerWants ? 'RESTARTING…' : iWant ? 'WAITING FOR YOUR PARTNER…' : 'REMATCH'}
+              </button>
+              <button
+                onClick={exitMp}
+                className="mt-4 text-[10px] tracking-[0.4em] text-white/30 transition-colors hover:text-white/70"
+              >
+                BACK TO THE MENU
+              </button>
+            </>
+          ) : (
+            <>
+              <button
+                onClick={() => startGame()}
+                className="border border-white/50 px-10 py-3 text-sm tracking-[0.45em] transition-colors duration-200 hover:bg-white hover:text-black focus:outline-none focus:ring-1 focus:ring-white"
+              >
+                DESCEND AGAIN
+              </button>
+              <p className="mt-5 text-[10px] tracking-[0.3em] text-white/25">PRESS R</p>
+            </>
+          )}
         </div>
       )}
     </div>

@@ -230,6 +230,30 @@ export class SoundEngine {
     }
   }
 
+  /** The prey's sonar ping, as heard by the hunter — loud, panned, distant. */
+  pingHeard(pan: number, vol: number): void {
+    if (!this.ctx || vol <= 0.004) return
+    const t = this.ctx.currentTime
+    const p = this.out(pan, 1, 0.85)
+    if (!p) return
+    const o = this.ctx.createOscillator()
+    o.type = 'sine'
+    o.frequency.setValueAtTime(700, t)
+    o.frequency.exponentialRampToValueAtTime(160, t + 0.38)
+    const g = this.ctx.createGain()
+    g.gain.setValueAtTime(0, t)
+    g.gain.linearRampToValueAtTime(clamp(vol * 0.62, 0, 0.6), t + 0.02)
+    g.gain.exponentialRampToValueAtTime(0.0008, t + 0.5)
+    const lp = this.ctx.createBiquadFilter()
+    lp.type = 'lowpass'
+    lp.frequency.value = 1400
+    o.connect(g)
+    g.connect(lp)
+    lp.connect(p)
+    o.start(t)
+    o.stop(t + 0.55)
+  }
+
   /** Dull wall thud when a ping wavefront strikes masonry. */
   thud(pan: number, vol: number): void {
     if (!this.ctx || vol <= 0.004) return
@@ -483,11 +507,11 @@ export class SoundEngine {
     }
   }
 
-  /** Soft player footstep. */
-  step(vol: number): void {
+  /** Soft footstep (pan optional — the hunter hears prey footsteps). */
+  step(vol: number, pan = 0): void {
     if (!this.ctx || vol <= 0.004) return
     const t = this.ctx.currentTime
-    const p = this.out(0, 1, 0.15)
+    const p = this.out(pan, 1, 0.15)
     if (!p) return
     const src = this.noiseSource()
     if (!src) return

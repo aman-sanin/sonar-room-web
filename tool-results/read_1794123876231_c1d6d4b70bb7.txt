@@ -1,0 +1,892 @@
+     1→// The Sonar Room — core game engine.
+     2→// You are blind: the world only exists for the ~1.5s a ping takes to fade.
+     3→// Pings expand as wavefronts; where they touch wall segments the wireframe
+     4→// blinks into existence. Sound is spatialized. The thing in the dark hears
+     5→// every ping you make.
+     6→
+     7→import {
+     8→  GameMap,
+     9→  Vec,
+    10→  Cell,
+    11→  generateMap,
+    12→  bfsPath,
+    13→  cellCenter,
+    14→  isSolid,
+    15→  nearestOpenCell,
+    16→  segDist,
+    17→  worldToCell,
+    18→} from './maze'
+    19→import { SoundEngine } from './audio'
+    20→
+    21→export type EnginePhase = 'idle' | 'playing' | 'dead' | 'win'
+    22→
+    23→export interface RunResult {
+    24→  outcome: 'escaped' | 'caught'
+    25→  timeMs: number
+    26→  keysFound: number
+    27→  pings: number
+    28→}
+    29→
+    30→export interface EngineHooks {
+    31→  onKeys?: (n: number) => void
+    32→  onToast?: (msg: string) => void
+    33→  onEnd?: (r: RunResult) => void
+    34→}
+    35→
+    36→interface Ping {
+    37→  ox: number
+    38→  oy: number
+    39→  r: number
+    40→  maxR: number
+    41→  speed: number
+    42→  owner: 0 | 1 // 0 = player, 1 = monster/door (dimmer, silent reveal)
+    43→  hits: Uint8Array
+    44→  doorHit: boolean
+    45→  jag: number[]
+    46→  dead: boolean
+    47→}
+    48→
+    49→type MonsterState = 'dormant' | 'wander' | 'investigate' | 'chase'
+    50→
+    51→interface Monster {
+    52→  x: number
+    53→  y: number
+    54→  state: MonsterState
+    55→  path: Vec[]
+    56→  pathI: number
+    57→  target: Cell | null
+    58→  repath: number
+    59→  lost: number
+    60→  growlT: number
+    61→  clickT: number
+    62→  stepT: number
+    63→  pendingAt: number
+    64→  pendingX: number
+    65→  pendingY: number
+    66→  revealT: number
+    67→  lastPX: number
+    68→  lastPY: number
+    69→}
+    70→
+    71→interface KeyItem {
+    72→  x: number
+    73→  y: number
+    74→  found: boolean
+    75→  revealT: number
+    76→  jT: number
+    77→}
+    78→
+    79→const PING_MAX_R = 640
+    80→const PING_SPEED = 500
+    81→const PING_COOLDOWN = 1.05
+    82→const PLAYER_SPEED = 152
+    83→const PLAYER_R = 9
+    84→const SENSE_R = 150 // monster senses you this close, ping or not
+    85→const LOSE_R = 310 // break this far for long enough and it loses you
+    86→const HEAR_R = 920 // it hears any ping made within this range
+    87→const CATCH_R = 20
+    88→const GRACE = 8 // seconds before the thing wakes up
+    89→
+    90→const clamp = (v: number, a: number, b: number): number => Math.max(a, Math.min(b, v))
+    91→const expFade = (age: number, tau: number): number => Math.exp(-age / tau)
+    92→
+    93→export class SonarEngine {
+    94→  map: GameMap | null = null
+    95→  phase: EnginePhase = 'idle'
+    96→  time = 0
+    97→  cooldown = 0
+    98→  pingsUsed = 0
+    99→  keysFound = 0
+   100→  unlocked = false
+   101→  danger = 0
+   102→  input = { x: 0, y: 0 }
+   103→
+   104→  private player = { x: 0, y: 0 }
+   105→  private cam = { x: 0, y: 0 }
+   106→  private monster: Monster | null = null
+   107→  private keys: KeyItem[] = []
+   108→  private pings: Ping[] = []
+   109→  private revealT: Float32Array = new Float32Array(0)
+   110→  private revealS: Float32Array = new Float32Array(0)
+   111→  private doorRevealT = -99
+   112→  private shake = 0
+   113→  private hbT = 0
+   114→  private stepT = 0
+   115→  private thudGate = 0
+   116→  private screechGate = 0
+   117→  private beaconT = 0
+   118→  private graceAnnounced = false
+   119→  private chaseAnnounced = false
+   120→  private deathAt = 0
+   121→  private winAt = 0
+   122→  private seed = 1
+   123→
+   124→  constructor(
+   125→    private audio: SoundEngine,
+   126→    private hooks: EngineHooks = {},
+   127→  ) {}
+   128→
+   129→  private panOf(x: number): number {
+   130→    return clamp((x - this.player.x) / 300, -1, 1)
+   131→  }
+   132→
+   133→  private volByDist(d: number, range: number): number {
+   134→    return clamp(1 - d / range, 0, 1)
+   135→  }
+   136→
+   137→  start(seed = Math.floor(Math.random() * 1e9)): void {
+   138→    this.seed = seed
+   139→    this.map = generateMap(seed)
+   140→    const n = this.map.edges.length
+   141→    this.revealT = new Float32Array(n).fill(-99)
+   142→    this.revealS = new Float32Array(n)
+   143→    this.player = { ...this.map.start }
+   144→    this.cam = { ...this.map.start }
+   145→    this.keys = this.map.keys.map((k) => ({ x: k.x, y: k.y, found: false, revealT: -99, jT: 1 + Math.random() * 2 }))
+   146→    this.monster = {
+   147→      x: this.map.monsterStart.x,
+   148→      y: this.map.monsterStart.y,
+   149→      state: 'dormant',
+   150→      path: [],
+   151→      pathI: 0,
+   152→      target: null,
+   153→      repath: 0,
+   154→      lost: 0,
+   155→      growlT: 2 + Math.random() * 3,
+   156→      clickT: 3 + Math.random() * 3,
+   157→      stepT: 0,
+   158→      pendingAt: 0,
+   159→      pendingX: 0,
+   160→      pendingY: 0,
+   161→      revealT: -99,
+   162→      lastPX: 0,
+   163→      lastPY: 0,
+   164→    }
+   165→    this.pings = []
+   166→    this.time = 0
+   167→    this.cooldown = 0
+   168→    this.pingsUsed = 0
+   169→    this.keysFound = 0
+   170→    this.unlocked = false
+   171→    this.danger = 0
+   172→    this.shake = 0
+   173→    this.doorRevealT = -99
+   174→    this.thudGate = 0
+   175→    this.screechGate = 0
+   176→    this.beaconT = 0
+   177→    this.graceAnnounced = false
+   178→    this.chaseAnnounced = false
+   179→    this.phase = 'playing'
+   180→    this.audio.setDanger(0)
+   181→    this.audio.setExitHum(0)
+   182→    this.hooks.onKeys?.(0)
+   183→    this.hooks.onToast?.('FIND THE KEYS — QUIETLY')
+   184→  }
+   185→
+   186→  /** Emit a sonar ping from the player. Costs noise. */
+   187→  ping(): boolean {
+   188→    if (this.phase !== 'playing' || this.cooldown > 0 || !this.map) return false
+   189→    this.cooldown = PING_COOLDOWN
+   190→    this.pingsUsed++
+   191→    this.pings.push(this.makePing(this.player.x, this.player.y, 0, PING_MAX_R, PING_SPEED))
+   192→    this.audio.ping()
+   193→    const m = this.monster
+   194→    if (m && m.state !== 'chase' && this.time > GRACE) {
+   195→      const d = Math.hypot(this.player.x - m.x, this.player.y - m.y)
+   196→      if (d < HEAR_R) {
+   197→        m.pendingAt = this.time + 0.35
+   198→        m.pendingX = this.player.x
+   199→        m.pendingY = this.player.y
+   200→      }
+   201→    }
+   202→    return true
+   203→  }
+   204→
+   205→  private makePing(ox: number, oy: number, owner: 0 | 1, maxR: number, speed: number): Ping {
+   206→    const jag: number[] = []
+   207→    for (let i = 0; i < 48; i++) jag.push((Math.random() - 0.5) * 2)
+   208→    return {
+   209→      ox,
+   210→      oy,
+   211→      r: 2,
+   212→      maxR,
+   213→      speed,
+   214→      owner,
+   215→      hits: new Uint8Array(this.map ? this.map.edges.length : 0),
+   216→      doorHit: false,
+   217→      jag,
+   218→      dead: false,
+   219→    }
+   220→  }
+   221→
+   222→  // ------------------------------------------------------------- collision
+   223→
+   224→  private hitsWall(x: number, y: number): boolean {
+   225→    const map = this.map
+   226→    if (!map) return false
+   227→    const c0 = Math.floor((x - PLAYER_R) / map.cell)
+   228→    const c1 = Math.floor((x + PLAYER_R) / map.cell)
+   229→    const r0 = Math.floor((y - PLAYER_R) / map.cell)
+   230→    const r1 = Math.floor((y + PLAYER_R) / map.cell)
+   231→    for (let r = r0; r <= r1; r++) {
+   232→      for (let c = c0; c <= c1; c++) {
+   233→        if (!isSolid(map, c, r)) continue
+   234→        const rx = c * map.cell
+   235→        const ry = r * map.cell
+   236→        const nx = clamp(x, rx, rx + map.cell)
+   237→        const ny = clamp(y, ry, ry + map.cell)
+   238→        if (Math.hypot(x - nx, y - ny) < PLAYER_R) return true
+   239→      }
+   240→    }
+   241→    return false
+   242→  }
+   243→
+   244→  // ---------------------------------------------------------------- update
+   245→
+   246→  update(dt: number): void {
+   247→    this.time += dt
+   248→    this.cooldown = Math.max(0, this.cooldown - dt)
+   249→    this.thudGate -= dt
+   250→    this.screechGate -= dt
+   251→    this.shake = Math.max(0, this.shake - dt * 1.6)
+   252→
+   253→    this.updatePings(dt)
+   254→
+   255→    if (this.phase === 'playing') {
+   256→      this.updatePlayer(dt)
+   257→      this.updateMonster(dt)
+   258→      this.updateKeys(dt)
+   259→      this.updateExit(dt)
+   260→      this.updateDanger(dt)
+   261→    } else {
+   262→      this.danger = Math.max(0, this.danger - dt * 0.8)
+   263→      this.audio.setDanger(this.danger)
+   264→    }
+   265→
+   266→    // Camera follows.
+   267→    const k = Math.min(1, dt * 4.5)
+   268→    this.cam.x += (this.player.x - this.cam.x) * k
+   269→    this.cam.y += (this.player.y - this.cam.y) * k
+   270→  }
+   271→
+   272→  private updatePings(dt: number): void {
+   273→    const map = this.map
+   274→    if (!map) return
+   275→    for (const p of this.pings) {
+   276→      const rPrev = p.r
+   277→      p.r = Math.min(p.maxR, p.r + p.speed * dt)
+   278→      if (p.owner === 0 || p.owner === 1) {
+   279→        // Edge crossings.
+   280→        let soundBudget = 2
+   281→        for (let i = 0; i < map.edges.length; i++) {
+   282→          if (p.hits[i]) continue
+   283→          const e = map.edges[i]
+   284→          const mx = (e.x1 + e.x2) / 2
+   285→          const my = (e.y1 + e.y2) / 2
+   286→          // Cheap reject by bounding box.
+   287→          const bx = Math.min(e.x1, e.x2) - p.r
+   288→          if (p.ox < bx || p.ox > Math.max(e.x1, e.x2) + p.r) {
+   289→            if (Math.abs(p.ox - mx) > p.r) continue
+   290→          }
+   291→          const d = segDist(p.ox, p.oy, e.x1, e.y1, e.x2, e.y2)
+   292→          if (d <= p.r && d > rPrev - 0.5) {
+   293→            p.hits[i] = 1
+   294→            const strength = clamp(1.08 - d / 720, 0.28, 1) * (p.owner === 1 ? 0.5 : 1)
+   295→            if (strength > this.revealS[i] * expFade(this.time - this.revealT[i], 0.55)) {
+   296→              this.revealS[i] = strength
+   297→              this.revealT[i] = this.time
+   298→            }
+   299→            if (p.owner === 0 && this.phase === 'playing' && soundBudget > 0 && this.thudGate <= 0) {
+   300→              const vol = strength * clamp(1.2 - d / 620, 0.2, 1) * 0.85
+   301→              this.audio.thud(this.panOf(mx), vol)
+   302→              soundBudget--
+   303→              this.thudGate = 0.045
+   304→            }
+   305→          }
+   306→        }
+   307→        // Door reveal.
+   308→        const dd = Math.hypot(map.door.midX - p.ox, map.door.midY - p.oy)
+   309→        if (dd <= p.r && dd > rPrev - 0.5) {
+   310→          this.doorRevealT = this.time
+   311→          if (p.owner === 0 && !p.doorHit && this.phase === 'playing') {
+   312→            p.doorHit = true
+   313→            this.audio.doorTone(this.panOf(map.door.midX), this.volByDist(dd, 640) * 0.5 + 0.05)
+   314→          }
+   315→        }
+   316→        // Key reveals.
+   317→        for (const k of this.keys) {
+   318→          if (k.found) continue
+   319→          const kd = Math.hypot(k.x - p.ox, k.y - p.oy)
+   320→          if (kd <= p.r && kd > rPrev - 0.5) {
+   321→            k.revealT = this.time
+   322→            if (p.owner === 0 && this.phase === 'playing') {
+   323→              this.audio.jingle(this.panOf(k.x), 0.16)
+   324→            }
+   325→          }
+   326→        }
+   327→        // Monster reveal (only player pings screech).
+   328→        const m = this.monster
+   329→        if (m && p.owner === 0) {
+   330→          const md = Math.hypot(m.x - p.ox, m.y - p.oy)
+   331→          if (md <= p.r && md > rPrev - 0.5) {
+   332→            m.revealT = this.time
+   333→            if (this.phase === 'playing' && this.screechGate <= 0) {
+   334→              this.audio.screech(this.panOf(m.x), clamp(0.6 - md / 1400, 0.22, 0.6))
+   335→              this.screechGate = 1.5
+   336→              if (m.state !== 'chase' && this.time > GRACE) {
+   337→                m.pendingAt = this.time + 0.3
+   338→                m.pendingX = this.player.x
+   339→                m.pendingY = this.player.y
+   340→              }
+   341→            }
+   342→          }
+   343→        }
+   344→      }
+   345→      if (p.r >= p.maxR) p.dead = true
+   346→    }
+   347→    this.pings = this.pings.filter((p) => !p.dead)
+   348→  }
+   349→
+   350→  private updatePlayer(dt: number): void {
+   351→    let { x, y } = this.input
+   352→    const l = Math.hypot(x, y)
+   353→    if (l > 1) {
+   354→      x /= l
+   355→      y /= l
+   356→    }
+   357→    const moving = l > 0.08
+   358→    const sp = PLAYER_SPEED
+   359→    const nx = this.player.x + x * sp * dt
+   360→    if (!this.hitsWall(nx, this.player.y)) this.player.x = nx
+   361→    const ny = this.player.y + y * sp * dt
+   362→    if (!this.hitsWall(this.player.x, ny)) this.player.y = ny
+   363→
+   364→    if (moving) {
+   365→      this.stepT -= dt
+   366→      if (this.stepT <= 0) {
+   367→        this.stepT = 0.34
+   368→        this.audio.step(0.045)
+   369→      }
+   370→    }
+   371→  }
+   372→
+   373→  private updateKeys(dt: number): void {
+   374→    for (const k of this.keys) {
+   375→      if (k.found) continue
+   376→      const d = Math.hypot(this.player.x - k.x, this.player.y - k.y)
+   377→      // Faint jingle hints when a key is close by.
+   378→      k.jT -= dt
+   379→      if (d < 300 && k.jT <= 0) {
+   380→        k.jT = 3.1 + Math.random() * 1.6
+   381→        this.audio.jingle(this.panOf(k.x), 0.05 + 0.1 * this.volByDist(d, 300))
+   382→      }
+   383→      if (d < 24) {
+   384→        k.found = true
+   385→        this.keysFound++
+   386→        this.audio.chime(this.panOf(k.x), 0.5)
+   387→        this.hooks.onKeys?.(this.keysFound)
+   388→        if (this.keysFound >= 3) {
+   389→          this.unlocked = true
+   390→          this.audio.unlock()
+   391→          this.hooks.onToast?.('THE DOOR IS OPEN')
+   392→          const m = this.monster
+   393→          if (m && m.state === 'dormant') m.state = 'wander'
+   394→        }
+   395→      }
+   396→    }
+   397→  }
+   398→
+   399→  private updateExit(dt: number): void {
+   400→    const map = this.map
+   401→    if (!map) return
+   402→    const d = Math.hypot(this.player.x - map.door.midX, this.player.y - map.door.midY)
+   403→    if (this.unlocked) {
+   404→      this.audio.setExitHum(this.volByDist(d, 280))
+   405→      this.beaconT -= dt
+   406→      if (this.beaconT <= 0) {
+   407→        this.beaconT = 2.4
+   408→        this.pings.push(this.makePing(map.door.midX, map.door.midY, 1, 170, 320))
+   409→        if (d < 620) this.audio.doorBlip(this.panOf(map.door.midX), 0.05 + 0.14 * this.volByDist(d, 620))
+   410→      }
+   411→      if (d < 42) {
+   412→        this.winAt = this.time
+   413→        this.phase = 'win'
+   414→        this.audio.setDanger(0)
+   415→        this.audio.setExitHum(0)
+   416→        this.audio.win()
+   417→        this.hooks.onEnd?.({
+   418→          outcome: 'escaped',
+   419→          timeMs: Math.round(this.time * 1000),
+   420→          keysFound: this.keysFound,
+   421→          pings: this.pingsUsed,
+   422→        })
+   423→      }
+   424→    } else {
+   425→      this.audio.setExitHum(0)
+   426→    }
+   427→  }
+   428→
+   429→  private updateDanger(dt: number): void {
+   430→    const m = this.monster
+   431→    if (!m) return
+   432→    if (this.time > GRACE) {
+   433→      if (!this.graceAnnounced) {
+   434→        this.graceAnnounced = true
+   435→        this.hooks.onToast?.('SOMETHING IS AWAKE')
+   436→        this.audio.growl(this.panOf(m.x), 0.5)
+   437→      }
+   438→      const d = Math.hypot(this.player.x - m.x, this.player.y - m.y)
+   439→      let target = clamp(1 - d / 340, 0, 1)
+   440→      if (m.state !== 'chase') target *= 0.6
+   441→      this.danger += (target - this.danger) * Math.min(1, dt * 4)
+   442→      if (this.danger > 0.04) {
+   443→        this.hbT -= dt
+   444→        if (this.hbT <= 0) {
+   445→          this.hbT = 1.15 - 0.68 * this.danger
+   446→          this.audio.heartbeat(0.1 + 0.45 * this.danger)
+   447→        }
+   448→      }
+   449→      if (m.state === 'chase') this.shake = Math.max(this.shake, this.danger * 0.55)
+   450→    }
+   451→    this.audio.setDanger(this.danger)
+   452→  }
+   453→
+   454→  // -------------------------------------------------------------- monster
+   455→
+   456→  private updateMonster(dt: number): void {
+   457→    const map = this.map
+   458→    const m = this.monster
+   459→    if (!map || !m) return
+   460→    if (m.state === 'dormant') {
+   461→      if (this.time > GRACE) m.state = 'wander'
+   462→      return
+   463→    }
+   464→
+   465→    const d = Math.hypot(this.player.x - m.x, this.player.y - m.y)
+   466→    const mc = worldToCell(map, m.x, m.y)
+   467→
+   468→    // Sense the player up close — no ping needed.
+   469→    if (d < SENSE_R && m.state !== 'chase') {
+   470→      m.state = 'chase'
+   471→      m.path = []
+   472→      m.repath = 0
+   473→      m.lost = 0
+   474→      if (this.screechGate <= 0) {
+   475→        this.audio.screech(this.panOf(m.x), 0.65)
+   476→        this.screechGate = 1.2
+   477→      }
+   478→      if (!this.chaseAnnounced) {
+   479→        this.chaseAnnounced = true
+   480→        this.hooks.onToast?.('RUN')
+   481→      }
+   482→    }
+   483→
+   484→    // A ping it heard (delayed reaction).
+   485→    if (m.pendingAt > 0 && this.time >= m.pendingAt) {
+   486→      m.pendingAt = 0
+   487→      if (m.state !== 'chase') {
+   488→        const cell = nearestOpenCell(map, ...this.cellOfPoint(m.pendingX, m.pendingY))
+   489→        m.state = 'investigate'
+   490→        m.target = cell
+   491→        m.path = bfsPath(map, mc.c, mc.r, cell.c, cell.r)
+   492→        m.pathI = 0
+   493→      }
+   494→    }
+   495→
+   496→    let speed = 60
+   497→    if (m.state === 'chase') {
+   498→      speed = 148 + this.keysFound * 8
+   499→      m.lastPX = this.player.x
+   500→      m.lastPY = this.player.y
+   501→      if (d > LOSE_R) {
+   502→        m.lost += dt
+   503→        if (m.lost > 2.2) {
+   504→          m.state = 'investigate'
+   505→          m.target = nearestOpenCell(map, ...this.cellOfPoint(m.lastPX, m.lastPY))
+   506→          m.path = bfsPath(map, mc.c, mc.r, m.target.c, m.target.r)
+   507→          m.pathI = 0
+   508→        }
+   509→      } else {
+   510→        m.lost = 0
+   511→      }
+   512→      m.repath -= dt
+   513→      const pc = worldToCell(map, this.player.x, this.player.y)
+   514→      if (m.repath <= 0) {
+   515→        m.repath = 0.32
+   516→        m.path = bfsPath(map, mc.c, mc.r, pc.c, pc.r)
+   517→        m.pathI = 0
+   518→      }
+   519→      m.clickT -= dt
+   520→      if (m.clickT <= 0) {
+   521→        m.clickT = 2.6
+   522→        this.monsterClick(m)
+   523→      }
+   524→      m.stepT -= dt
+   525→      if (m.stepT <= 0 && d < 460) {
+   526→        m.stepT = 0.27
+   527→        this.audio.monsterStep(this.panOf(m.x), 0.1 + 0.3 * this.volByDist(d, 460))
+   528→      }
+   529→    } else if (m.state === 'investigate') {
+   530→      speed = 98
+   531→      if (!m.target || m.pathI >= m.path.length) {
+   532→        m.state = 'wander'
+   533→        m.target = null
+   534→        m.path = []
+   535→      }
+   536→      m.clickT -= dt
+   537→      if (m.clickT <= 0) {
+   538→        m.clickT = 4.5 + Math.random() * 2.5
+   539→        this.monsterClick(m)
+   540→      }
+   541→    } else {
+   542→      // wander — it drifts through the dark, but its instinct pulls it
+   543→      // toward your region of the maze (biased random walk).
+   544→      speed = 60
+   545→      if (m.pathI >= m.path.length) {
+   546→        const cands: Cell[] = []
+   547→        for (let i = 0; i < 8; i++) {
+   548→          const c = clamp(mc.c + Math.floor((Math.random() - 0.5) * 22), 1, map.cols - 2)
+   549→          const r = clamp(mc.r + Math.floor((Math.random() - 0.5) * 16), 1, map.rows - 2)
+   550→          const cell = nearestOpenCell(map, c, r)
+   551→          if (Math.hypot(cell.c - mc.c, cell.r - mc.r) >= 3) cands.push(cell)
+   552→        }
+   553→        if (cands.length > 0) {
+   554→          let pick = cands[Math.floor(Math.random() * cands.length)]
+   555→          if (Math.random() < 0.6) {
+   556→            const pc = worldToCell(map, this.player.x, this.player.y)
+   557→            for (const c of cands) {
+   558→              if (
+   559→                Math.hypot(c.c - pc.c, c.r - pc.r) <
+   560→                Math.hypot(pick.c - pc.c, pick.r - pc.r)
+   561→              ) {
+   562→                pick = c
+   563→              }
+   564→            }
+   565→          }
+   566→          m.path = bfsPath(map, mc.c, mc.r, pick.c, pick.r)
+   567→          m.pathI = 0
+   568→        }
+   569→      }
+   570→      m.growlT -= dt
+   571→      if (m.growlT <= 0) {
+   572→        m.growlT = 3.5 + Math.random() * 4.5
+   573→        this.audio.growl(this.panOf(m.x), 0.06 + 0.4 * this.volByDist(d, 560))
+   574→      }
+   575→      m.clickT -= dt
+   576→      if (m.clickT <= 0) {
+   577→        m.clickT = 6 + Math.random() * 3
+   578→        this.monsterClick(m)
+   579→      }
+   580→    }
+   581→
+   582→    // Follow path.
+   583→    if (m.pathI < m.path.length) {
+   584→      const wp = m.path[m.pathI]
+   585→      const dx = wp.x - m.x
+   586→      const dy = wp.y - m.y
+   587→      const dl = Math.hypot(dx, dy)
+   588→      if (dl < 6) {
+   589→        m.pathI++
+   590→      } else {
+   591→        m.x += (dx / dl) * speed * dt
+   592→        m.y += (dy / dl) * speed * dt
+   593→      }
+   594→    }
+   595→
+   596→    // Catch.
+   597→    if (d < CATCH_R) {
+   598→      this.deathAt = this.time
+   599→      this.phase = 'dead'
+   600→      this.shake = 1.4
+   601→      this.audio.setDanger(0)
+   602→      this.audio.setExitHum(0)
+   603→      this.audio.death()
+   604→      this.hooks.onEnd?.({
+   605→        outcome: 'caught',
+   606→        timeMs: Math.round(this.time * 1000),
+   607→        keysFound: this.keysFound,
+   608→        pings: this.pingsUsed,
+   609→      })
+   610→    }
+   611→  }
+   612→
+   613→  private cellOfPoint(x: number, y: number): [number, number] {
+   614→    const map = this.map
+   615→    if (!map) return [1, 1]
+   616→    const c = worldToCell(map, x, y)
+   617→    return [c.c, c.r]
+   618→  }
+   619→
+   620→  /** The monster emits its own echolocation — you see the world flash through ITS senses. */
+   621→  private monsterClick(m: Monster): void {
+   622→    const d = Math.hypot(this.player.x - m.x, this.player.y - m.y)
+   623→    this.audio.monsterClick(this.panOf(m.x), 0.05 + 0.3 * this.volByDist(d, 700))
+   624→    this.pings.push(this.makePing(m.x, m.y, 1, 430, 440))
+   625→  }
+   626→
+   627→  // ---------------------------------------------------------------- render
+   628→
+   629→  render(ctx: CanvasRenderingContext2D, cw: number, ch: number, dpr: number): void {
+   630→    ctx.setTransform(dpr, 0, 0, dpr, 0, 0)
+   631→    ctx.fillStyle = '#000000'
+   632→    ctx.fillRect(0, 0, cw, ch)
+   633→    const map = this.map
+   634→    if (!map) return
+   635→    const t = this.time
+   636→
+   637→    const zoom = clamp(Math.min(cw, ch) / 660, 0.9, 1.5)
+   638→    const sh = this.shake
+   639→    const sx = (Math.random() - 0.5) * 12 * sh
+   640→    const sy = (Math.random() - 0.5) * 12 * sh
+   641→
+   642→    ctx.save()
+   643→    ctx.translate(cw / 2 + sx, ch / 2 + sy)
+   644→    ctx.scale(zoom, zoom)
+   645→    ctx.translate(-this.cam.x, -this.cam.y)
+   646→    ctx.lineCap = 'round'
+   647→    ctx.lineJoin = 'round'
+   648→
+   649→    // --- Revealed wall wireframes ---
+   650→    for (let i = 0; i < map.edges.length; i++) {
+   651→      const age = t - this.revealT[i]
+   652→      if (age > 3 || age < 0) continue
+   653→      const a = this.revealS[i] * expFade(age, 0.55)
+   654→      if (a < 0.015) continue
+   655→      const e = map.edges[i]
+   656→      ctx.strokeStyle = `rgba(255,255,255,${(a * 0.22).toFixed(3)})`
+   657→      ctx.lineWidth = 5
+   658→      ctx.beginPath()
+   659→      ctx.moveTo(e.x1, e.y1)
+   660→      ctx.lineTo(e.x2, e.y2)
+   661→      ctx.stroke()
+   662→      ctx.strokeStyle = `rgba(255,255,255,${a.toFixed(3)})`
+   663→      ctx.lineWidth = 1.8
+   664→      ctx.beginPath()
+   665→      ctx.moveTo(e.x1, e.y1)
+   666→      ctx.lineTo(e.x2, e.y2)
+   667→      ctx.stroke()
+   668→    }
+   669→
+   670→    // --- Exit door ---
+   671→    const dAge = t - this.doorRevealT
+   672→    const dA = dAge >= 0 ? expFade(dAge, 0.6) : 0
+   673→    if (dA > 0.02) {
+   674→      const door = map.door
+   675→      const depth = 16
+   676→      const half = map.cell / 2 - 6
+   677→      ctx.save()
+   678→      ctx.translate(door.midX, door.midY)
+   679→      if (door.vertical) {
+   680→        const dir = door.midX < map.w / 2 ? 1 : -1
+   681→        const pulse = this.unlocked ? 0.65 + 0.35 * Math.sin(t * 5) : 1
+   682→        const a = dA * pulse
+   683→        ctx.strokeStyle = `rgba(255,255,255,${(a * 0.9).toFixed(3)})`
+   684→        ctx.lineWidth = 2
+   685→        ctx.strokeRect(dir > 0 ? -depth : 0, -half, depth, half * 2)
+   686→        if (!this.unlocked) {
+   687→          // Sealed: cross bars.
+   688→          ctx.beginPath()
+   689→          ctx.moveTo(dir > 0 ? -depth : 0, -half)
+   690→          ctx.lineTo(dir > 0 ? 0 : depth, half)
+   691→          ctx.moveTo(dir > 0 ? -depth : 0, half)
+   692→          ctx.lineTo(dir > 0 ? 0 : depth, -half)
+   693→          ctx.stroke()
+   694→        } else {
+   695→          ctx.strokeStyle = `rgba(255,255,255,${(a * 0.5).toFixed(3)})`
+   696→          ctx.strokeRect(dir > 0 ? -depth + 4 : 4, -half + 5, depth - 8, half * 2 - 10)
+   697→        }
+   698→      } else {
+   699→        const dir = door.midY < map.h / 2 ? 1 : -1
+   700→        const pulse = this.unlocked ? 0.65 + 0.35 * Math.sin(t * 5) : 1
+   701→        const a = dA * pulse
+   702→        ctx.strokeStyle = `rgba(255,255,255,${(a * 0.9).toFixed(3)})`
+   703→        ctx.lineWidth = 2
+   704→        ctx.strokeRect(-half, dir > 0 ? -depth : 0, half * 2, depth)
+   705→        if (!this.unlocked) {
+   706→          ctx.beginPath()
+   707→          ctx.moveTo(-half, dir > 0 ? -depth : 0)
+   708→          ctx.lineTo(half, dir > 0 ? 0 : depth)
+   709→          ctx.moveTo(-half, dir > 0 ? 0 : depth)
+   710→          ctx.lineTo(half, dir > 0 ? -depth : 0)
+   711→          ctx.stroke()
+   712→        } else {
+   713→          ctx.strokeStyle = `rgba(255,255,255,${(a * 0.5).toFixed(3)})`
+   714→          ctx.strokeRect(-half + 5, dir > 0 ? -depth + 4 : 4, half * 2 - 10, depth - 8)
+   715→        }
+   716→      }
+   717→      ctx.restore()
+   718→    }
+   719→
+   720→    // --- Keys ---
+   721→    for (const k of this.keys) {
+   722→      if (k.found) continue
+   723→      const age = t - k.revealT
+   724→      if (age < 0 || age > 2.4) continue
+   725→      const a = expFade(age, 0.6)
+   726→      if (a < 0.02) continue
+   727→      const rot = t * 1.2 + k.x * 0.01
+   728→      ctx.save()
+   729→      ctx.translate(k.x, k.y)
+   730→      ctx.rotate(rot)
+   731→      ctx.strokeStyle = `rgba(255,255,255,${(a * 0.95).toFixed(3)})`
+   732→      ctx.lineWidth = 1.8
+   733→      ctx.beginPath()
+   734→      ctx.moveTo(0, -10)
+   735→      ctx.lineTo(7, 0)
+   736→      ctx.lineTo(0, 10)
+   737→      ctx.lineTo(-7, 0)
+   738→      ctx.closePath()
+   739→      ctx.stroke()
+   740→      ctx.beginPath()
+   741→      ctx.moveTo(0, -3.5)
+   742→      ctx.lineTo(2.6, 0)
+   743→      ctx.lineTo(0, 3.5)
+   744→      ctx.lineTo(-2.6, 0)
+   745→      ctx.closePath()
+   746→      ctx.stroke()
+   747→      ctx.restore()
+   748→    }
+   749→
+   750→    // --- Ping rings ---
+   751→    for (const p of this.pings) {
+   752→      const base = 1 - p.r / p.maxR
+   753→      if (p.owner === 0) {
+   754→        const a = base * 0.9
+   755→        ctx.strokeStyle = `rgba(255,255,255,${a.toFixed(3)})`
+   756→        ctx.lineWidth = 2
+   757→        ctx.beginPath()
+   758→        ctx.arc(p.ox, p.oy, p.r, 0, Math.PI * 2)
+   759→        ctx.stroke()
+   760→        const r2 = p.r - 18
+   761→        if (r2 > 4) {
+   762→          ctx.strokeStyle = `rgba(255,255,255,${(base * 0.22).toFixed(3)})`
+   763→          ctx.lineWidth = 1
+   764→          ctx.beginPath()
+   765→          ctx.arc(p.ox, p.oy, r2, 0, Math.PI * 2)
+   766→          ctx.stroke()
+   767→        }
+   768→        // Corruption: the ring bends around the monster.
+   769→        const m = this.monster
+   770→        if (m) {
+   771→          const md = Math.hypot(m.x - p.ox, m.y - p.oy)
+   772→          if (Math.abs(md - p.r) < 50 && md > 30) {
+   773→            const ang = Math.atan2(m.y - p.oy, m.x - p.ox)
+   774→            ctx.strokeStyle = `rgba(255,255,255,${(base * 1.1).toFixed(3)})`
+   775→            ctx.lineWidth = 2
+   776→            ctx.beginPath()
+   777→            const segs = 12
+   778→            const width = 0.38
+   779→            for (let i = 0; i <= segs; i++) {
+   780→              const th = ang - width / 2 + (width * i) / segs
+   781→              const jr = p.r + p.jag[i % p.jag.length] * 9
+   782→              const px = p.ox + Math.cos(th) * jr
+   783→              const py = p.oy + Math.sin(th) * jr
+   784→              if (i === 0) ctx.moveTo(px, py)
+   785→              else ctx.lineTo(px, py)
+   786→            }
+   787→            ctx.stroke()
+   788→          }
+   789→        }
+   790→      } else {
+   791→        // Monster/door ping: jagged, dim, wrong.
+   792→        const a = base * 0.32
+   793→        ctx.strokeStyle = `rgba(255,255,255,${a.toFixed(3)})`
+   794→        ctx.lineWidth = 1.2
+   795→        ctx.beginPath()
+   796→        const segs = 44
+   797→        for (let i = 0; i <= segs; i++) {
+   798→          const th = (i / segs) * Math.PI * 2
+   799→          const jr = p.r + p.jag[i % p.jag.length] * 4
+   800→          const px = p.ox + Math.cos(th) * jr
+   801→          const py = p.oy + Math.sin(th) * jr
+   802→          if (i === 0) ctx.moveTo(px, py)
+   803→          else ctx.lineTo(px, py)
+   804→        }
+   805→        ctx.closePath()
+   806→        ctx.stroke()
+   807→      }
+   808→    }
+   809→
+   810→    // --- Monster body (only when a ping just touched it) ---
+   811→    const m = this.monster
+   812→    if (m) {
+   813→      const mage = t - m.revealT
+   814→      if (mage >= 0 && mage < 0.5) {
+   815→        const a = (1 - mage / 0.5) * 0.95
+   816→        const s = Math.floor(t * 12)
+   817→        ctx.strokeStyle = `rgba(255,255,255,${a.toFixed(3)})`
+   818→        ctx.lineWidth = 2
+   819→        ctx.beginPath()
+   820→        const pts = 16
+   821→        for (let i = 0; i <= pts; i++) {
+   822→          const th = (i / pts) * Math.PI * 2
+   823→          const n = Math.sin(s * 3.7 + i * 2.4) * 0.5 + Math.sin(s * 9.1 + i * 5.3) * 0.5
+   824→          const rr = 13 + n * 10
+   825→          const px = m.x + Math.cos(th) * rr
+   826→          const py = m.y + Math.sin(th) * rr
+   827→          if (i === 0) ctx.moveTo(px, py)
+   828→          else ctx.lineTo(px, py)
+   829→        }
+   830→        ctx.closePath()
+   831→        ctx.stroke()
+   832→      }
+   833→    }
+   834→
+   835→    // --- Danger static ---
+   836→    if (this.danger > 0.05 && this.phase === 'playing') {
+   837→      const n = Math.floor(this.danger * 18)
+   838→      for (let i = 0; i < n; i++) {
+   839→        const a = (0.03 + Math.random() * 0.09) * this.danger
+   840→        ctx.fillStyle = `rgba(255,255,255,${a.toFixed(3)})`
+   841→        const px = this.player.x + (Math.random() - 0.5) * 520
+   842→        const py = this.player.y + (Math.random() - 0.5) * 520
+   843→        ctx.fillRect(px, py, 1.6, 1.6)
+   844→      }
+   845→    }
+   846→
+   847→    // --- Player ---
+   848→    const px = this.player.x
+   849→    const py = this.player.y
+   850→    ctx.strokeStyle = 'rgba(255,255,255,0.95)'
+   851→    ctx.lineWidth = 2
+   852→    ctx.beginPath()
+   853→    ctx.arc(px, py, PLAYER_R, 0, Math.PI * 2)
+   854→    ctx.stroke()
+   855→    ctx.fillStyle = 'rgba(255,255,255,0.95)'
+   856→    ctx.beginPath()
+   857→    ctx.arc(px, py, 2.4, 0, Math.PI * 2)
+   858→    ctx.fill()
+   859→    // Ping cooldown ring.
+   860→    if (this.cooldown > 0) {
+   861→      const frac = 1 - this.cooldown / PING_COOLDOWN
+   862→      ctx.strokeStyle = 'rgba(255,255,255,0.3)'
+   863→      ctx.lineWidth = 1.5
+   864→      ctx.beginPath()
+   865→      ctx.arc(px, py, 15, -Math.PI / 2, -Math.PI / 2 + frac * Math.PI * 2)
+   866→      ctx.stroke()
+   867→    } else {
+   868→      ctx.strokeStyle = `rgba(255,255,255,${(0.26 + 0.12 * Math.sin(t * 5)).toFixed(3)})`
+   869→      ctx.lineWidth = 1
+   870→      ctx.beginPath()
+   871→      ctx.arc(px, py, 15, 0, Math.PI * 2)
+   872→      ctx.stroke()
+   873→    }
+   874→
+   875→    ctx.restore()
+   876→
+   877→    // --- Death flash (screen space) ---
+   878→    if (this.phase === 'dead' && t - this.deathAt < 0.07) {
+   879→      ctx.fillStyle = 'rgba(255,255,255,0.85)'
+   880→      ctx.fillRect(0, 0, cw, ch)
+   881→    }
+   882→  }
+   883→
+   884→  get elapsedMs(): number {
+   885→    return Math.round(this.time * 1000)
+   886→  }
+   887→
+   888→  get currentSeed(): number {
+   889→    return this.seed
+   890→  }
+   891→}
+   892→

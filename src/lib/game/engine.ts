@@ -31,7 +31,16 @@ export interface EngineHooks {
   onKeys?: (n: number) => void
   onToast?: (msg: string) => void
   onEnd?: (r: RunResult) => void
+  /** Multiplayer: events the engine asks the component to relay to the peer. */
+  onEmit?: (e: HuntEmit) => void
 }
+
+/** solo = vs AI · host = survivor, monster is remote · hunter = you are the monster. */
+export type EngineMode = 'solo' | 'host' | 'hunter'
+
+export type HuntEmit =
+  | { t: 'ping'; x: number; y: number }
+  | { t: 'click'; x: number; y: number }
 
 interface Ping {
   ox: number
@@ -66,6 +75,10 @@ interface Monster {
   revealT: number
   lastPX: number
   lastPY: number
+  /** Multiplayer: latest peer-reported position to ease toward. */
+  netX: number
+  netY: number
+  netMoving: boolean
 }
 
 interface KeyItem {
@@ -100,6 +113,7 @@ export class SonarEngine {
   unlocked = false
   danger = 0
   input = { x: 0, y: 0 }
+  mode: EngineMode = 'solo'
 
   private player = { x: 0, y: 0 }
   private cam = { x: 0, y: 0 }
@@ -140,12 +154,15 @@ export class SonarEngine {
     const n = this.map.edges.length
     this.revealT = new Float32Array(n).fill(-99)
     this.revealS = new Float32Array(n)
-    this.player = { ...this.map.start }
-    this.cam = { ...this.map.start }
+    // In hunter mode the LOCAL body is the monster; the "monster" slot
+    // holds the remote survivor ghost. Audio panning stays relative to
+    // the local body either way.
+    this.player = this.mode === 'hunter' ? { ...this.map.monsterStart } : { ...this.map.start }
+    this.cam = { ...this.player }
     this.keys = this.map.keys.map((k) => ({ x: k.x, y: k.y, found: false, revealT: -99, jT: 1 + Math.random() * 2 }))
-    this.monster = {
-      x: this.map.monsterStart.x,
-      y: this.map.monsterStart.y,
+    const m: Monster = {
+      x: this.mode === 'hunter' ? this.map.start.x : this.map.monsterStart.x,
+      y: this.mode === 'hunter' ? this.map.start.y : this.map.monsterStart.y,
       state: 'dormant',
       path: [],
       pathI: 0,
@@ -161,7 +178,13 @@ export class SonarEngine {
       revealT: -99,
       lastPX: 0,
       lastPY: 0,
+      netX: 0,
+      netY: 0,
+      netMoving: false,
     }
+    m.netX = m.x
+    m.netY = m.y
+    this.monster = m
     this.pings = []
     this.time = 0
     this.cooldown = 0
@@ -180,18 +203,29 @@ export class SonarEngine {
     this.audio.setDanger(0)
     this.audio.setExitHum(0)
     this.hooks.onKeys?.(0)
-    this.hooks.onToast?.('FIND THE KEYS — QUIETLY')
+    this.hooks.onToast?.(
+      this.mode === 'hunter' ? 'SOMETHING FLESH IS IN THE DARK — LISTEN' : 'FIND THE KEYS — QUIETLY',
+    )
   }
 
-  /** Emit a sonar ping from the player. Costs noise. */
+  /** Emit a sonar ping — or, as the hunter, an echolocation click. Costs noise. */
   ping(): boolean {
     if (this.phase !== 'playing' || this.cooldown > 0 || !this.map) return false
     this.cooldown = PING_COOLDOWN
     this.pingsUsed++
+    if (this.mode === 'hunter') {
+      this.pings.push(this.makePing(this.player.x, this.player.y, 1, 430, 440))
+      this.audio.monsterClick(0, 0.32)
+      this.hooks.onEmit?.({ t: 'click', x: this.player.x, y: this.player.y })
+      return true
+    }
     this.pings.push(this.makePing(this.player.x, this.player.y, 0, PING_MAX_R, PING_SPEED))
     this.audio.ping()
+    if (this.mode === 'host') {
+      this.hooks.onEmit?.({ t: 'ping', x: this.player.x, y: this.player.y })
+    }
     const m = this.monster
-    if (m && m.state !== 'chase' && this.time > GRACE) {
+    if (this.mode === 'solo' && m && m.state !== 'chase' && this.time > GRACE) {
       const d = Math.hypot(this.player.x - m.x, this.player.y - m.y)
       if (d < HEAR_R) {
         m.pendingAt = this.time + 0.35
@@ -254,10 +288,20 @@ export class SonarEngine {
 
     if (this.phase === 'playing') {
       this.updatePlayer(dt)
-      this.updateMonster(dt)
-      this.updateKeys(dt)
-      this.updateExit(dt)
-      this.updateDanger(dt)
+      if (this.mode === 'hunter') {
+        this.updateGhost(dt)
+        this.updateDanger(dt)
+      } else if (this.mode === 'host') {
+        this.updateRemoteMonster(dt)
+        this.updateKeys(dt)
+        this.updateExit(dt)
+        this.updateDanger(dt)
+      } else {
+        this.updateMonster(dt)
+        this.updateKeys(dt)
+        this.updateExit(dt)
+        this.updateDanger(dt)
+      }
     } else {
       this.danger = Math.max(0, this.danger - dt * 0.8)
       this.audio.setDanger(this.danger)
@@ -324,16 +368,16 @@ export class SonarEngine {
             }
           }
         }
-        // Monster reveal (only player pings screech).
+        // Monster / survivor-ghost reveal (only survivor pings screech).
         const m = this.monster
         if (m && p.owner === 0) {
           const md = Math.hypot(m.x - p.ox, m.y - p.oy)
           if (md <= p.r && md > rPrev - 0.5) {
             m.revealT = this.time
-            if (this.phase === 'playing' && this.screechGate <= 0) {
+            if (this.phase === 'playing' && this.mode !== 'hunter' && this.screechGate <= 0) {
               this.audio.screech(this.panOf(m.x), clamp(0.6 - md / 1400, 0.22, 0.6))
               this.screechGate = 1.5
-              if (m.state !== 'chase' && this.time > GRACE) {
+              if (this.mode === 'solo' && m.state !== 'chase' && this.time > GRACE) {
                 m.pendingAt = this.time + 0.3
                 m.pendingX = this.player.x
                 m.pendingY = this.player.y
@@ -364,8 +408,9 @@ export class SonarEngine {
     if (moving) {
       this.stepT -= dt
       if (this.stepT <= 0) {
-        this.stepT = 0.34
-        this.audio.step(0.045)
+        this.stepT = this.mode === 'hunter' ? 0.3 : 0.34
+        if (this.mode === 'hunter') this.audio.monsterStep(0, 0.05)
+        else this.audio.step(0.045)
       }
     }
   }
@@ -432,7 +477,13 @@ export class SonarEngine {
     if (this.time > GRACE) {
       if (!this.graceAnnounced) {
         this.graceAnnounced = true
-        this.hooks.onToast?.('SOMETHING IS AWAKE')
+        this.hooks.onToast?.(
+          this.mode === 'solo'
+            ? 'SOMETHING IS AWAKE'
+            : this.mode === 'hunter'
+              ? 'THE PREY IS SOMEWHERE — IT PINGS'
+              : 'IT IS SOMEWHERE — LISTENING',
+        )
         this.audio.growl(this.panOf(m.x), 0.5)
       }
       const d = Math.hypot(this.player.x - m.x, this.player.y - m.y)
@@ -594,20 +645,99 @@ export class SonarEngine {
     }
 
     // Catch.
-    if (d < CATCH_R) {
-      this.deathAt = this.time
-      this.phase = 'dead'
-      this.shake = 1.4
-      this.audio.setDanger(0)
-      this.audio.setExitHum(0)
-      this.audio.death()
-      this.hooks.onEnd?.({
-        outcome: 'caught',
-        timeMs: Math.round(this.time * 1000),
-        keysFound: this.keysFound,
-        pings: this.pingsUsed,
-      })
+    this.checkCatch(d)
+  }
+
+  private checkCatch(d: number): void {
+    if (d >= CATCH_R || this.phase !== 'playing') return
+    const m = this.monster
+    this.deathAt = this.time
+    this.phase = 'dead'
+    this.shake = 1.4
+    this.audio.setDanger(0)
+    this.audio.setExitHum(0)
+    this.audio.death()
+    if (m) m.revealT = this.time
+    this.hooks.onEnd?.({
+      outcome: 'caught',
+      timeMs: Math.round(this.time * 1000),
+      keysFound: this.keysFound,
+      pings: this.pingsUsed,
+    })
+  }
+
+  // ------------------------------------------------------------ multiplayer
+
+  /** Host side: ease the monster toward the hunter's reported position. */
+  private updateRemoteMonster(dt: number): void {
+    const m = this.monster
+    if (!m) return
+    const k = Math.min(1, dt * 14)
+    m.x += (m.netX - m.x) * k
+    m.y += (m.netY - m.y) * k
+    if (m.netMoving) {
+      m.stepT -= dt
+      if (m.stepT <= 0) {
+        m.stepT = 0.3
+        const d = Math.hypot(this.player.x - m.x, this.player.y - m.y)
+        if (d < 560) this.audio.monsterStep(this.panOf(m.x), 0.06 + 0.3 * this.volByDist(d, 560))
+      }
     }
+    this.checkCatch(Math.hypot(this.player.x - m.x, this.player.y - m.y))
+  }
+
+  /** Hunter side: the survivor ghost eases toward reported positions. */
+  private updateGhost(dt: number): void {
+    const m = this.monster
+    if (!m) return
+    const k = Math.min(1, dt * 14)
+    m.x += (m.netX - m.x) * k
+    m.y += (m.netY - m.y) * k
+    if (m.netMoving) {
+      m.stepT -= dt
+      if (m.stepT <= 0) {
+        m.stepT = 0.34
+        const d = Math.hypot(this.player.x - m.x, this.player.y - m.y)
+        if (d < 700) this.audio.step(0.03 + 0.3 * this.volByDist(d, 700), this.panOf(m.x))
+      }
+    }
+  }
+
+  setRemoteMonster(x: number, y: number, moving: boolean): void {
+    const m = this.monster
+    if (!m) return
+    m.netX = x
+    m.netY = y
+    m.netMoving = moving
+  }
+
+  setRemoteSurvivor(x: number, y: number, moving: boolean): void {
+    this.setRemoteMonster(x, y, moving)
+  }
+
+  /** Host side: the hunter's echolocation click, arriving over the wire. */
+  netMonsterClick(x: number, y: number): void {
+    if (this.phase !== 'playing' || !this.map) return
+    const d = Math.hypot(this.player.x - x, this.player.y - y)
+    this.audio.monsterClick(this.panOf(x), 0.05 + 0.3 * this.volByDist(d, 700))
+    this.pings.push(this.makePing(x, y, 1, 430, 440))
+  }
+
+  /** Hunter side: the survivor's sonar ping, arriving over the wire. */
+  netSurvivorPing(x: number, y: number): void {
+    if (this.phase !== 'playing' || !this.map) return
+    const d = Math.hypot(this.player.x - x, this.player.y - y)
+    this.audio.pingHeard(this.panOf(x), 0.3 + 0.7 * this.volByDist(d, 900))
+    this.pings.push(this.makePing(x, y, 0, PING_MAX_R, PING_SPEED))
+  }
+
+  get playerPos(): { x: number; y: number } {
+    return { x: this.player.x, y: this.player.y }
+  }
+
+  get otherPos(): { x: number; y: number } {
+    const m = this.monster
+    return m ? { x: m.x, y: m.y } : { x: -9999, y: -9999 }
   }
 
   private cellOfPoint(x: number, y: number): [number, number] {
@@ -807,11 +937,11 @@ export class SonarEngine {
       }
     }
 
-    // --- Monster body (only when a ping just touched it) ---
+    // --- Monster body (revealed by a survivor ping) / survivor ghost (hunter) ---
     const m = this.monster
     if (m) {
       const mage = t - m.revealT
-      if (mage >= 0 && mage < 0.5) {
+      if (mage >= 0 && mage < 0.5 && this.mode !== 'hunter') {
         const a = (1 - mage / 0.5) * 0.95
         const s = Math.floor(t * 12)
         ctx.strokeStyle = `rgba(255,255,255,${a.toFixed(3)})`
@@ -829,6 +959,18 @@ export class SonarEngine {
         }
         ctx.closePath()
         ctx.stroke()
+      } else if (mage >= 0 && mage < 0.7 && this.mode === 'hunter') {
+        // The survivor, caught in the light of their own ping.
+        const a = (1 - mage / 0.7) * 0.95
+        ctx.strokeStyle = `rgba(255,255,255,${a.toFixed(3)})`
+        ctx.lineWidth = 2
+        ctx.beginPath()
+        ctx.arc(m.x, m.y, PLAYER_R, 0, Math.PI * 2)
+        ctx.stroke()
+        ctx.fillStyle = `rgba(255,255,255,${a.toFixed(3)})`
+        ctx.beginPath()
+        ctx.arc(m.x, m.y, 2.4, 0, Math.PI * 2)
+        ctx.fill()
       }
     }
 
@@ -844,18 +986,37 @@ export class SonarEngine {
       }
     }
 
-    // --- Player ---
+    // --- Local body: survivor ring, or the hunter's own jagged shape ---
     const px = this.player.x
     const py = this.player.y
-    ctx.strokeStyle = 'rgba(255,255,255,0.95)'
-    ctx.lineWidth = 2
-    ctx.beginPath()
-    ctx.arc(px, py, PLAYER_R, 0, Math.PI * 2)
-    ctx.stroke()
-    ctx.fillStyle = 'rgba(255,255,255,0.95)'
-    ctx.beginPath()
-    ctx.arc(px, py, 2.4, 0, Math.PI * 2)
-    ctx.fill()
+    if (this.mode === 'hunter') {
+      const s = Math.floor(t * 12)
+      ctx.strokeStyle = 'rgba(255,255,255,0.72)'
+      ctx.lineWidth = 1.8
+      ctx.beginPath()
+      const pts = 16
+      for (let i = 0; i <= pts; i++) {
+        const th = (i / pts) * Math.PI * 2
+        const n = Math.sin(s * 3.7 + i * 2.4) * 0.5 + Math.sin(s * 9.1 + i * 5.3) * 0.5
+        const rr = 11 + n * 5
+        const qx = px + Math.cos(th) * rr
+        const qy = py + Math.sin(th) * rr
+        if (i === 0) ctx.moveTo(qx, qy)
+        else ctx.lineTo(qx, qy)
+      }
+      ctx.closePath()
+      ctx.stroke()
+    } else {
+      ctx.strokeStyle = 'rgba(255,255,255,0.95)'
+      ctx.lineWidth = 2
+      ctx.beginPath()
+      ctx.arc(px, py, PLAYER_R, 0, Math.PI * 2)
+      ctx.stroke()
+      ctx.fillStyle = 'rgba(255,255,255,0.95)'
+      ctx.beginPath()
+      ctx.arc(px, py, 2.4, 0, Math.PI * 2)
+      ctx.fill()
+    }
     // Ping cooldown ring.
     if (this.cooldown > 0) {
       const frac = 1 - this.cooldown / PING_COOLDOWN
