@@ -8,6 +8,8 @@ import {
   GameMap,
   Vec,
   Cell,
+  DoorColor,
+  DoorSpec,
   generateMap,
   bfsPath,
   cellCenter,
@@ -16,6 +18,7 @@ import {
   segDist,
   worldToCell,
 } from './maze'
+import type { HuntDoorColor, KeyCounts } from './net'
 import { SoundEngine } from './audio'
 
 export type EnginePhase = 'idle' | 'playing' | 'dead' | 'win'
@@ -25,10 +28,12 @@ export interface RunResult {
   timeMs: number
   keysFound: number
   pings: number
+  /** Hunt mode: which door the survivor slipped through. */
+  door?: DoorColor
 }
 
 export interface EngineHooks {
-  onKeys?: (n: number) => void
+  onKeys?: (c: KeyCounts) => void
   onToast?: (msg: string) => void
   onEnd?: (r: RunResult) => void
   /** Multiplayer: events the engine asks the component to relay to the peer. */
@@ -41,6 +46,7 @@ export type EngineMode = 'solo' | 'host' | 'hunter'
 export type HuntEmit =
   | { t: 'ping'; x: number; y: number }
   | { t: 'click'; x: number; y: number }
+  | { t: 'door'; i: 0 | 1; color: HuntDoorColor; progress: number; unlocked: boolean }
 
 interface Ping {
   ox: number
@@ -84,9 +90,22 @@ interface Monster {
 interface KeyItem {
   x: number
   y: number
+  color: DoorColor
   found: boolean
   revealT: number
   jT: number
+}
+
+interface DoorState {
+  spec: DoorSpec
+  unlocked: boolean
+  /** 0..1 — the survivor's lock-picking channel (3 s of continuous work). */
+  progress: number
+  revealT: number
+  channeling: boolean
+  tickT: number
+  lastStep: number
+  beaconT: number
 }
 
 const PING_MAX_R = 640
@@ -99,6 +118,9 @@ const LOSE_R = 310 // break this far for long enough and it loses you
 const HEAR_R = 920 // it hears any ping made within this range
 const CATCH_R = 20
 const GRACE = 8 // seconds before the thing wakes up
+const UNLOCK_TIME = 3 // seconds of continuous work to open a hunt door
+const UNLOCK_R = 58 // stand this close to work a lock
+const ESCAPE_R = 56 // slip out through an open hunt door
 
 const clamp = (v: number, a: number, b: number): number => Math.max(a, Math.min(b, v))
 const expFade = (age: number, tau: number): number => Math.exp(-age / tau)
@@ -110,7 +132,6 @@ export class SonarEngine {
   cooldown = 0
   pingsUsed = 0
   keysFound = 0
-  unlocked = false
   danger = 0
   input = { x: 0, y: 0 }
   mode: EngineMode = 'solo'
@@ -119,10 +140,10 @@ export class SonarEngine {
   private cam = { x: 0, y: 0 }
   private monster: Monster | null = null
   private keys: KeyItem[] = []
+  private doorState: DoorState[] = []
   private pings: Ping[] = []
   private revealT: Float32Array = new Float32Array(0)
   private revealS: Float32Array = new Float32Array(0)
-  private doorRevealT = -99
   private shake = 0
   private hbT = 0
   private stepT = 0
@@ -150,7 +171,8 @@ export class SonarEngine {
 
   start(seed = Math.floor(Math.random() * 1e9)): void {
     this.seed = seed
-    this.map = generateMap(seed)
+    // Hunt mode (2-player) builds the two-door variant of the maze.
+    this.map = generateMap(seed, this.mode !== 'solo')
     const n = this.map.edges.length
     this.revealT = new Float32Array(n).fill(-99)
     this.revealS = new Float32Array(n)
@@ -159,7 +181,24 @@ export class SonarEngine {
     // the local body either way.
     this.player = this.mode === 'hunter' ? { ...this.map.monsterStart } : { ...this.map.start }
     this.cam = { ...this.player }
-    this.keys = this.map.keys.map((k) => ({ x: k.x, y: k.y, found: false, revealT: -99, jT: 1 + Math.random() * 2 }))
+    this.keys = this.map.keys.map((k) => ({
+      x: k.x,
+      y: k.y,
+      color: k.color,
+      found: false,
+      revealT: -99,
+      jT: 1 + Math.random() * 2,
+    }))
+    this.doorState = this.map.doors.map((spec) => ({
+      spec,
+      unlocked: false,
+      progress: 0,
+      revealT: -99,
+      channeling: false,
+      tickT: 0,
+      lastStep: -1,
+      beaconT: 0,
+    }))
     const m: Monster = {
       x: this.mode === 'hunter' ? this.map.start.x : this.map.monsterStart.x,
       y: this.mode === 'hunter' ? this.map.start.y : this.map.monsterStart.y,
@@ -190,10 +229,8 @@ export class SonarEngine {
     this.cooldown = 0
     this.pingsUsed = 0
     this.keysFound = 0
-    this.unlocked = false
     this.danger = 0
     this.shake = 0
-    this.doorRevealT = -99
     this.thudGate = 0
     this.screechGate = 0
     this.beaconT = 0
@@ -202,9 +239,13 @@ export class SonarEngine {
     this.phase = 'playing'
     this.audio.setDanger(0)
     this.audio.setExitHum(0)
-    this.hooks.onKeys?.(0)
+    this.hooks.onKeys?.({ total: 0, crimson: 0, jade: 0 })
     this.hooks.onToast?.(
-      this.mode === 'hunter' ? 'SOMETHING FLESH IS IN THE DARK — LISTEN' : 'FIND THE KEYS — QUIETLY',
+      this.mode === 'hunter'
+        ? 'SOMETHING FLESH IS IN THE DARK — LISTEN'
+        : this.mode === 'host'
+          ? 'FIND THE COLORED KEYS — QUIETLY'
+          : 'FIND THE KEYS — QUIETLY',
     )
   }
 
@@ -294,12 +335,12 @@ export class SonarEngine {
       } else if (this.mode === 'host') {
         this.updateRemoteMonster(dt)
         this.updateKeys(dt)
-        this.updateExit(dt)
+        this.updateDoors(dt)
         this.updateDanger(dt)
       } else {
         this.updateMonster(dt)
         this.updateKeys(dt)
-        this.updateExit(dt)
+        this.updateDoors(dt)
         this.updateDanger(dt)
       }
     } else {
@@ -348,13 +389,15 @@ export class SonarEngine {
             }
           }
         }
-        // Door reveal.
-        const dd = Math.hypot(map.door.midX - p.ox, map.door.midY - p.oy)
-        if (dd <= p.r && dd > rPrev - 0.5) {
-          this.doorRevealT = this.time
-          if (p.owner === 0 && !p.doorHit && this.phase === 'playing') {
-            p.doorHit = true
-            this.audio.doorTone(this.panOf(map.door.midX), this.volByDist(dd, 640) * 0.5 + 0.05)
+        // Door reveals.
+        for (const ds of this.doorState) {
+          const dd = Math.hypot(ds.spec.midX - p.ox, ds.spec.midY - p.oy)
+          if (dd <= p.r && dd > rPrev - 0.5) {
+            ds.revealT = this.time
+            if (p.owner === 0 && !p.doorHit && this.phase === 'playing') {
+              p.doorHit = true
+              this.audio.doorTone(this.panOf(ds.spec.midX), this.volByDist(dd, 640) * 0.5 + 0.05)
+            }
           }
         }
         // Key reveals.
@@ -429,46 +472,149 @@ export class SonarEngine {
         k.found = true
         this.keysFound++
         this.audio.chime(this.panOf(k.x), 0.5)
-        this.hooks.onKeys?.(this.keysFound)
-        if (this.keysFound >= 3) {
-          this.unlocked = true
-          this.audio.unlock()
-          this.hooks.onToast?.('THE DOOR IS OPEN')
-          const m = this.monster
-          if (m && m.state === 'dormant') m.state = 'wander'
+        const counts = this.counts()
+        this.hooks.onKeys?.(counts)
+        if (this.mode === 'solo') {
+          if (this.keysFound >= 3) {
+            const d0 = this.doorState[0]
+            if (d0) d0.unlocked = true
+            this.audio.unlock()
+            this.hooks.onToast?.('THE DOOR IS OPEN')
+            const m = this.monster
+            if (m && m.state === 'dormant') m.state = 'wander'
+          }
+        } else if (k.color !== 'white' && counts[k.color] >= 3) {
+          this.hooks.onToast?.(`ALL ${k.color.toUpperCase()} KEYS — THAT DOOR CAN BE UNLOCKED`)
         }
       }
     }
   }
 
-  private updateExit(dt: number): void {
+  private counts(): KeyCounts {
+    let crimson = 0
+    let jade = 0
+    for (const k of this.keys) {
+      if (!k.found) continue
+      if (k.color === 'crimson') crimson++
+      else if (k.color === 'jade') jade++
+    }
+    return { total: this.keysFound, crimson, jade }
+  }
+
+  private keysOf(color: DoorColor): number {
+    let n = 0
+    for (const k of this.keys) if (k.found && k.color === color) n++
+    return n
+  }
+
+  private updateDoors(dt: number): void {
     const map = this.map
     if (!map) return
-    const d = Math.hypot(this.player.x - map.door.midX, this.player.y - map.door.midY)
-    if (this.unlocked) {
-      this.audio.setExitHum(this.volByDist(d, 280))
-      this.beaconT -= dt
-      if (this.beaconT <= 0) {
-        this.beaconT = 2.4
-        this.pings.push(this.makePing(map.door.midX, map.door.midY, 1, 170, 320))
-        if (d < 620) this.audio.doorBlip(this.panOf(map.door.midX), 0.05 + 0.14 * this.volByDist(d, 620))
+    let hum = 0
+    for (let i = 0; i < this.doorState.length; i++) {
+      const ds = this.doorState[i]
+      const d = Math.hypot(this.player.x - ds.spec.midX, this.player.y - ds.spec.midY)
+
+      if (ds.unlocked) {
+        // Open door: hum + beacon pings, and the way out.
+        hum = Math.max(hum, this.volByDist(d, 300))
+        ds.beaconT -= dt
+        if (ds.beaconT <= 0) {
+          ds.beaconT = 2.4
+          this.pings.push(this.makePing(ds.spec.midX, ds.spec.midY, 1, 170, 320))
+          if (d < 620)
+            this.audio.doorBlip(this.panOf(ds.spec.midX), 0.05 + 0.14 * this.volByDist(d, 620))
+        }
+        if (this.phase === 'playing' && d < (this.mode === 'solo' ? 42 : ESCAPE_R)) {
+          this.finishEscape(i)
+        }
+        continue
       }
-      if (d < 42) {
-        this.winAt = this.time
-        this.phase = 'win'
-        this.audio.setDanger(0)
-        this.audio.setExitHum(0)
-        this.audio.win()
-        this.hooks.onEnd?.({
-          outcome: 'escaped',
-          timeMs: Math.round(this.time * 1000),
-          keysFound: this.keysFound,
-          pings: this.pingsUsed,
-        })
+
+      if (this.mode !== 'host') continue
+
+      // --- Hunt lock channel: all 3 keys of this door's color, then hold
+      //     still beside it for three full seconds. Step away and the lock
+      //     slams back shut. ---
+      const ready = this.keysOf(ds.spec.color) >= 3
+      if (ready && d < UNLOCK_R) {
+        if (!ds.channeling) {
+          ds.channeling = true
+          ds.tickT = 0
+          this.hooks.onToast?.('UNLOCKING — HOLD STILL')
+        }
+        ds.progress += dt / UNLOCK_TIME
+        ds.tickT -= dt
+        if (ds.tickT <= 0) {
+          ds.tickT = 0.75
+          this.audio.doorBlip(0, 0.1 + 0.22 * ds.progress)
+        }
+        const step = Math.floor(ds.progress * 8)
+        if (step !== ds.lastStep) {
+          ds.lastStep = step
+          this.emitDoor(i, ds)
+        }
+        if (ds.progress >= 1) {
+          ds.progress = 1
+          ds.unlocked = true
+          ds.channeling = false
+          this.audio.unlock(this.panOf(ds.spec.midX))
+          this.hooks.onToast?.(`THE ${ds.spec.color.toUpperCase()} DOOR IS OPEN — GO`)
+          this.emitDoor(i, ds)
+        }
+      } else {
+        if (ds.channeling && ds.progress > 0.08) {
+          this.hooks.onToast?.('UNLOCK INTERRUPTED')
+          this.audio.thud(this.panOf(ds.spec.midX), 0.3)
+        }
+        if (ds.channeling && ds.progress > 0) {
+          ds.progress = 0
+          ds.lastStep = -1
+          this.emitDoor(i, ds)
+        }
+        ds.channeling = false
       }
-    } else {
-      this.audio.setExitHum(0)
+
+      // A lock you can work calls to you — a faint beacon marks the door.
+      if (ready) {
+        ds.beaconT -= dt
+        if (ds.beaconT <= 0) {
+          ds.beaconT = 3.4
+          this.pings.push(this.makePing(ds.spec.midX, ds.spec.midY, 1, 190, 300))
+          if (d < 520)
+            this.audio.doorBlip(this.panOf(ds.spec.midX), 0.03 + 0.09 * this.volByDist(d, 520))
+        }
+      }
     }
+    this.audio.setExitHum(hum)
+  }
+
+  private finishEscape(doorIndex: number): void {
+    if (this.phase !== 'playing') return
+    this.winAt = this.time
+    this.phase = 'win'
+    this.audio.setDanger(0)
+    this.audio.setExitHum(0)
+    this.audio.win()
+    this.hooks.onEnd?.({
+      outcome: 'escaped',
+      timeMs: Math.round(this.time * 1000),
+      keysFound: this.keysFound,
+      pings: this.pingsUsed,
+      door: this.doorState[doorIndex]?.spec.color,
+    })
+  }
+
+  private emitDoor(i: number, ds: DoorState): void {
+    if (ds.spec.color === 'white') return // solo doors never go over the wire
+    const progress = Math.min(1, Math.round(ds.progress * 100) / 100)
+    this.hooks.onEmit?.({
+      t: 'door',
+      i: i as 0 | 1,
+      color: ds.spec.color,
+      progress,
+      unlocked: ds.unlocked,
+    })
   }
 
   private updateDanger(dt: number): void {
@@ -731,6 +877,25 @@ export class SonarEngine {
     this.pings.push(this.makePing(x, y, 0, PING_MAX_R, PING_SPEED))
   }
 
+  /** Hunter side: the prey is working a lock — hear it, and the door burns. */
+  netDoorProgress(i: number, progress: number, unlocked: boolean): void {
+    const ds = this.doorState[i]
+    if (!ds || this.phase !== 'playing') return
+    ds.progress = progress
+    ds.unlocked = unlocked
+    if (unlocked) {
+      ds.revealT = this.time
+      this.audio.unlock(this.panOf(ds.spec.midX))
+    } else if (progress > 0) {
+      ds.revealT = this.time
+      this.audio.doorBlip(this.panOf(ds.spec.midX), 0.08 + 0.24 * progress)
+    }
+  }
+
+  get doorColors(): DoorColor[] {
+    return this.doorState.map((d) => d.spec.color)
+  }
+
   get playerPos(): { x: number; y: number } {
     return { x: this.player.x, y: this.player.y }
   }
@@ -797,23 +962,31 @@ export class SonarEngine {
       ctx.stroke()
     }
 
-    // --- Exit door ---
-    const dAge = t - this.doorRevealT
-    const dA = dAge >= 0 ? expFade(dAge, 0.6) : 0
-    if (dA > 0.02) {
-      const door = map.door
+    // --- Exit doors (solo: one white · hunt: crimson + jade) ---
+    const doorRgb = (c: DoorColor): [number, number, number] =>
+      c === 'crimson' ? [255, 70, 86] : c === 'jade' ? [86, 255, 168] : [255, 255, 255]
+
+    for (const ds of this.doorState) {
+      const dAge = t - ds.revealT
+      const dA = dAge >= 0 ? expFade(dAge, 0.6) : 0
+      // A lock being worked burns through the dark on both sides of the wire.
+      const chanA = ds.progress > 0 && !ds.unlocked ? 0.42 : 0
+      const baseA = Math.max(dA, chanA)
+      if (baseA <= 0.02) continue
+      const [cr, cg, cb] = doorRgb(ds.spec.color)
+      const door = ds.spec
       const depth = 16
       const half = map.cell / 2 - 6
       ctx.save()
       ctx.translate(door.midX, door.midY)
       if (door.vertical) {
         const dir = door.midX < map.w / 2 ? 1 : -1
-        const pulse = this.unlocked ? 0.65 + 0.35 * Math.sin(t * 5) : 1
-        const a = dA * pulse
-        ctx.strokeStyle = `rgba(255,255,255,${(a * 0.9).toFixed(3)})`
+        const pulse = ds.unlocked ? 0.65 + 0.35 * Math.sin(t * 5) : 1
+        const a = baseA * pulse
+        ctx.strokeStyle = `rgba(${cr},${cg},${cb},${(a * 0.9).toFixed(3)})`
         ctx.lineWidth = 2
         ctx.strokeRect(dir > 0 ? -depth : 0, -half, depth, half * 2)
-        if (!this.unlocked) {
+        if (!ds.unlocked) {
           // Sealed: cross bars.
           ctx.beginPath()
           ctx.moveTo(dir > 0 ? -depth : 0, -half)
@@ -822,17 +995,17 @@ export class SonarEngine {
           ctx.lineTo(dir > 0 ? 0 : depth, -half)
           ctx.stroke()
         } else {
-          ctx.strokeStyle = `rgba(255,255,255,${(a * 0.5).toFixed(3)})`
+          ctx.strokeStyle = `rgba(${cr},${cg},${cb},${(a * 0.5).toFixed(3)})`
           ctx.strokeRect(dir > 0 ? -depth + 4 : 4, -half + 5, depth - 8, half * 2 - 10)
         }
       } else {
         const dir = door.midY < map.h / 2 ? 1 : -1
-        const pulse = this.unlocked ? 0.65 + 0.35 * Math.sin(t * 5) : 1
-        const a = dA * pulse
-        ctx.strokeStyle = `rgba(255,255,255,${(a * 0.9).toFixed(3)})`
+        const pulse = ds.unlocked ? 0.65 + 0.35 * Math.sin(t * 5) : 1
+        const a = baseA * pulse
+        ctx.strokeStyle = `rgba(${cr},${cg},${cb},${(a * 0.9).toFixed(3)})`
         ctx.lineWidth = 2
         ctx.strokeRect(-half, dir > 0 ? -depth : 0, half * 2, depth)
-        if (!this.unlocked) {
+        if (!ds.unlocked) {
           ctx.beginPath()
           ctx.moveTo(-half, dir > 0 ? -depth : 0)
           ctx.lineTo(half, dir > 0 ? 0 : depth)
@@ -840,25 +1013,34 @@ export class SonarEngine {
           ctx.lineTo(half, dir > 0 ? -depth : 0)
           ctx.stroke()
         } else {
-          ctx.strokeStyle = `rgba(255,255,255,${(a * 0.5).toFixed(3)})`
+          ctx.strokeStyle = `rgba(${cr},${cg},${cb},${(a * 0.5).toFixed(3)})`
           ctx.strokeRect(-half + 5, dir > 0 ? -depth + 4 : 4, half * 2 - 10, depth - 8)
         }
+      }
+      // Lock-picking progress ring.
+      if (ds.progress > 0 && !ds.unlocked) {
+        ctx.strokeStyle = `rgba(${cr},${cg},${cb},0.95)`
+        ctx.lineWidth = 2.5
+        ctx.beginPath()
+        ctx.arc(0, 0, 30, -Math.PI / 2, -Math.PI / 2 + ds.progress * Math.PI * 2)
+        ctx.stroke()
       }
       ctx.restore()
     }
 
-    // --- Keys ---
+    // --- Keys (colored to match their door) ---
     for (const k of this.keys) {
       if (k.found) continue
       const age = t - k.revealT
       if (age < 0 || age > 2.4) continue
       const a = expFade(age, 0.6)
       if (a < 0.02) continue
+      const [kr, kg, kb] = doorRgb(k.color)
       const rot = t * 1.2 + k.x * 0.01
       ctx.save()
       ctx.translate(k.x, k.y)
       ctx.rotate(rot)
-      ctx.strokeStyle = `rgba(255,255,255,${(a * 0.95).toFixed(3)})`
+      ctx.strokeStyle = `rgba(${kr},${kg},${kb},${(a * 0.95).toFixed(3)})`
       ctx.lineWidth = 1.8
       ctx.beginPath()
       ctx.moveTo(0, -10)

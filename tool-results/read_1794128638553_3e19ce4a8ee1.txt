@@ -1,0 +1,1056 @@
+     1→'use client'
+     2→
+     3→// THE SONAR ROOM — you are blind. Click to ping, WASD to move.
+     4→// The screen is 90% black; the world only exists where sound has touched it.
+     5→
+     6→import { useCallback, useEffect, useRef, useState, useSyncExternalStore } from 'react'
+     7→import { io, type Socket } from 'socket.io-client'
+     8→import { SonarEngine, RunResult } from '@/lib/game/engine'
+     9→import { SoundEngine } from '@/lib/game/audio'
+    10→import type { Role, ReadyPayload, HuntEvt, CreateAck, JoinAck } from '@/lib/game/net'
+    11→
+    12→const ROOM_SERVICE_PORT = 3003
+    13→
+    14→type Phase = 'menu' | 'playing' | 'dead' | 'win'
+    15→type MpStage = 'off' | 'choose' | 'pick' | 'join' | 'lobby'
+    16→
+    17→interface Escape {
+    18→  timeMs: number
+    19→  pings: number
+    20→  keysFound: number
+    21→  createdAt: string
+    22→}
+    23→
+    24→const BEST_KEY = 'sonar_best_ms'
+    25→
+    26→function fmt(ms: number): string {
+    27→  const s = Math.floor(ms / 1000)
+    28→  const m = Math.floor(s / 60)
+    29→  return `${String(m).padStart(2, '0')}:${String(s % 60).padStart(2, '0')}`
+    30→}
+    31→
+    32→const emptySubscribe = () => () => {}
+    33→
+    34→export default function SonarRoom() {
+    35→  // Browser extensions (Dark Reader, Grammarly, translators…) inject <style>
+    36→  // and attribute mutations into the DOM before React hydrates, which breaks
+    37→  // structural hydration matching. The game is a pure client-side canvas +
+    38→  // WebAudio experience, so the server only needs to paint the black room.
+    39→  // Hydrate a minimal, trivially-matchable shell first, then mount the real
+    40→  // game once we know we are on the client.
+    41→  const hydrated = useSyncExternalStore(
+    42→    emptySubscribe,
+    43→    () => true,
+    44→    () => false,
+    45→  )
+    46→  if (!hydrated) {
+    47→    return <div className="fixed inset-0 bg-black" suppressHydrationWarning />
+    48→  }
+    49→  return <SonarRoomGame />
+    50→}
+    51→
+    52→function SonarRoomGame() {
+    53→  const canvasRef = useRef<HTMLCanvasElement | null>(null)
+    54→  const wrapRef = useRef<HTMLDivElement | null>(null)
+    55→  const engineRef = useRef<SonarEngine | null>(null)
+    56→  const audioRef = useRef<SoundEngine | null>(null)
+    57→  const phaseRef = useRef<Phase>('menu')
+    58→  const keysStateRef = useRef<Set<string>>(new Set())
+    59→  const joyRef = useRef({ x: 0, y: 0, active: false })
+    60→  const joyIdRef = useRef<number | null>(null)
+    61→  const joyCenterRef = useRef({ x: 0, y: 0 })
+    62→  const timerRef = useRef<HTMLSpanElement | null>(null)
+    63→  const knobRef = useRef<HTMLDivElement | null>(null)
+    64→  const toastTimeoutRef = useRef<number>(0)
+    65→  const endDelayRef = useRef<number>(0)
+    66→  const netRef = useRef<Socket | null>(null)
+    67→  const roleRef = useRef<Role | null>(null)
+    68→  const isHostRef = useRef(false)
+    69→  const mpStageRef = useRef<MpStage>('off')
+    70→  const mpActiveRef = useRef(false)
+    71→  const iWantRef = useRef(false)
+    72→  const peerWantsRef = useRef(false)
+    73→  const peerLinkedRef = useRef(false)
+    74→  const startTimerRef = useRef<number>(0)
+    75→
+    76→  const [phase, setPhaseState] = useState<Phase>('menu')
+    77→  const [keysFound, setKeysFound] = useState(0)
+    78→  const [toast, setToast] = useState<string | null>(null)
+    79→  const [result, setResult] = useState<RunResult | null>(null)
+    80→  const [best, setBest] = useState<number | null>(null)
+    81→  const [escapes, setEscapes] = useState<Escape[]>([])
+    82→  const [touchMode, setTouchMode] = useState(false)
+    83→  const [menuVisible, setMenuVisible] = useState(true)
+    84→  const [mpStage, setMpStage] = useState<MpStage>('off')
+    85→  const [role, setRole] = useState<Role | null>(null)
+    86→  const [roomCode, setRoomCode] = useState<string | null>(null)
+    87→  const [mpStatus, setMpStatus] = useState('')
+    88→  const [mpError, setMpError] = useState('')
+    89→  const [joinInput, setJoinInput] = useState('')
+    90→  const [peerLinked, setPeerLinked] = useState(false)
+    91→  const [peerLost, setPeerLost] = useState(false)
+    92→  const [iWant, setIWant] = useState(false)
+    93→  const [peerWants, setPeerWants] = useState(false)
+    94→  const [copied, setCopied] = useState(false)
+    95→
+    96→  const setMpStageBoth = useCallback((s: MpStage) => {
+    97→    mpStageRef.current = s
+    98→    setMpStage(s)
+    99→  }, [])
+   100→
+   101→  const setPhase = useCallback((p: Phase) => {
+   102→    phaseRef.current = p
+   103→    setPhaseState(p)
+   104→  }, [])
+   105→
+   106→  const showToast = useCallback((msg: string) => {
+   107→    setToast(msg)
+   108→    window.clearTimeout(toastTimeoutRef.current)
+   109→    toastTimeoutRef.current = window.setTimeout(() => setToast(null), 2600)
+   110→  }, [])
+   111→
+   112→  // ------------------------------------------------------------- joystick
+   113→  const resetJoy = useCallback(() => {
+   114→    joyIdRef.current = null
+   115→    joyRef.current = { x: 0, y: 0, active: false }
+   116→    if (knobRef.current) knobRef.current.style.transform = 'translate(-50%, -50%)'
+   117→  }, [])
+   118→
+   119→  const loadEscapes = useCallback(async () => {
+   120→    try {
+   121→      const res = await fetch('/api/runs', { cache: 'no-store' })
+   122→      if (!res.ok) return
+   123→      const data = (await res.json()) as { escapes?: Escape[] }
+   124→      setEscapes(data.escapes ?? [])
+   125→    } catch {
+   126→      /* offline is fine */
+   127→    }
+   128→  }, [])
+   129→
+   130→  const handleEnd = useCallback(
+   131→    (r: RunResult, mp = false) => {
+   132→      setResult(r)
+   133→      // Let the death flash / win tone breathe before the overlay lands.
+   134→      window.clearTimeout(endDelayRef.current)
+   135→      endDelayRef.current = window.setTimeout(() => {
+   136→        setPhase(r.outcome === 'escaped' ? 'win' : 'dead')
+   137→        setMenuVisible(true)
+   138→      }, r.outcome === 'escaped' ? 700 : 1100)
+   139→      if (mp) {
+   140→        // Multiplayer runs are not comparable with solo times — share the
+   141→        // verdict with the hunter instead of the leaderboard.
+   142→        netRef.current?.emit('hunt:evt', {
+   143→          t: 'end',
+   144→          outcome: r.outcome,
+   145→          timeMs: r.timeMs,
+   146→          keysFound: r.keysFound,
+   147→          pings: r.pings,
+   148→        } satisfies HuntEvt)
+   149→        return
+   150→      }
+   151→      // Persist.
+   152→      try {
+   153→        if (r.outcome === 'escaped') {
+   154→          const prev = window.localStorage.getItem(BEST_KEY)
+   155→          const prevN = prev ? Number(prev) : Infinity
+   156→          if (r.timeMs < prevN) {
+   157→            window.localStorage.setItem(BEST_KEY, String(r.timeMs))
+   158→            setBest(r.timeMs)
+   159→          }
+   160→        }
+   161→      } catch {
+   162→        /* storage may be unavailable */
+   163→      }
+   164→      void fetch('/api/runs', {
+   165→        method: 'POST',
+   166→        headers: { 'Content-Type': 'application/json' },
+   167→        body: JSON.stringify(r),
+   168→      })
+   169→        .then(() => (r.outcome === 'escaped' ? loadEscapes() : undefined))
+   170→        .catch(() => undefined)
+   171→    },
+   172→    [loadEscapes, setPhase],
+   173→  )
+   174→
+   175→  const startGame = useCallback((seed?: number) => {
+   176→    const audio = audioRef.current
+   177→    const engine = engineRef.current
+   178→    if (!audio || !engine) return
+   179→    // Touch-capable devices get the joystick from the very first frame —
+   180→    // never make a blind player tap first just to unlock their controls.
+   181→    const coarse = window.matchMedia?.('(pointer: coarse)').matches ?? false
+   182→    const touchable = (navigator.maxTouchPoints ?? 0) > 0 || 'ontouchstart' in window
+   183→    if (coarse || touchable) setTouchMode(true)
+   184→    // Multiplayer: role decides who simulates what. Solo: vs the AI thing.
+   185→    const mp = mpActiveRef.current || (mpStageRef.current === 'lobby' && roleRef.current !== null)
+   186→    mpActiveRef.current = mp
+   187→    engine.mode = mp ? (roleRef.current === 'monster' ? 'hunter' : 'host') : 'solo'
+   188→    iWantRef.current = false
+   189→    peerWantsRef.current = false
+   190→    setIWant(false)
+   191→    setPeerWants(false)
+   192→    setPeerLost(false)
+   193→    setMpStageBoth('off')
+   194→    audio.ensure()
+   195→    window.clearTimeout(endDelayRef.current)
+   196→    resetJoy()
+   197→    setResult(null)
+   198→    setKeysFound(0)
+   199→    setToast(null)
+   200→    setMenuVisible(false)
+   201→    engine.start(seed ?? Math.floor(Math.random() * 1e9))
+   202→    setPhase('playing')
+   203→  }, [resetJoy, setPhase, setMpStageBoth])
+   204→
+   205→  // --------------------------------------------------------- multiplayer
+   206→  const exitMp = useCallback(() => {
+   207→    netRef.current?.emit('hunt:leave')
+   208→    roleRef.current = null
+   209→    isHostRef.current = false
+   210→    mpActiveRef.current = false
+   211→    iWantRef.current = false
+   212→    peerWantsRef.current = false
+   213→    setRole(null)
+   214→    setRoomCode(null)
+   215→    setMpStatus('')
+   216→    setMpError('')
+   217→    setPeerLinked(false)
+   218→    setPeerLost(false)
+   219→    setIWant(false)
+   220→    setPeerWants(false)
+   221→    setJoinInput('')
+   222→    setMpStageBoth('off')
+   223→    setPhase('menu')
+   224→    setMenuVisible(true)
+   225→  }, [setPhase, setMpStageBoth])
+   226→
+   227→  const beginCreate = useCallback(
+   228→    (r: Role) => {
+   229→      setMpError('')
+   230→      roleRef.current = r
+   231→      setRole(r)
+   232→      isHostRef.current = true
+   233→      const socket = netRef.current
+   234→      if (!socket) return
+   235→      socket.emit('hunt:create', { role: r }, (ack: CreateAck) => {
+   236→        if (ack?.ok && ack.code) {
+   237→          setRoomCode(ack.code)
+   238→          setMpStatus('WAITING IN THE DARK — SHARE THE CODE')
+   239→          setMpStageBoth('lobby')
+   240→        } else {
+   241→          setMpError(ack?.error ?? 'THE DEEP IS SILENT — TRY AGAIN')
+   242→        }
+   243→      })
+   244→    },
+   245→    [],
+   246→  )
+   247→
+   248→  const doJoin = useCallback(() => {
+   249→    setMpError('')
+   250→    const socket = netRef.current
+   251→    if (!socket) return
+   252→    socket.emit('hunt:join', { code: joinInput }, (ack: JoinAck) => {
+   253→      if (ack?.ok && ack.code && ack.role) {
+   254→        roleRef.current = ack.role
+   255→        setRole(ack.role)
+   256→        isHostRef.current = false
+   257→        setRoomCode(ack.code)
+   258→        setMpStatus('FOUND THEM — LINKING…')
+   259→        setMpStageBoth('lobby')
+   260→      } else {
+   261→        setMpError(ack?.error ?? 'NO ANSWER — TRY AGAIN')
+   262→      }
+   263→    })
+   264→  }, [joinInput])
+   265→
+   266→  const requestRematch = useCallback(() => {
+   267→    if (!mpActiveRef.current) {
+   268→      startGame()
+   269→      return
+   270→    }
+   271→    iWantRef.current = true
+   272→    setIWant(true)
+   273→    netRef.current?.emit('hunt:evt', { t: 'rematch' } satisfies HuntEvt)
+   274→    if (peerWantsRef.current && isHostRef.current) {
+   275→      const seed = Math.floor(Math.random() * 1e9)
+   276→      netRef.current?.emit('hunt:evt', { t: 'start', seed } satisfies HuntEvt)
+   277→      startGame(seed)
+   278→    }
+   279→  }, [startGame])
+   280→
+   281→  // ------------------------------------------------------------ bootstrap
+   282→  useEffect(() => {
+   283→    const audio = new SoundEngine()
+   284→    audioRef.current = audio
+   285→    const engine = new SonarEngine(audio, {
+   286→      onKeys: (n) => {
+   287→        setKeysFound(n)
+   288→        if (mpActiveRef.current) {
+   289→          netRef.current?.emit('hunt:evt', { t: 'keys', n } satisfies HuntEvt)
+   290→        }
+   291→      },
+   292→      onToast: showToast,
+   293→      onEnd: (r) => handleEnd(r, mpActiveRef.current),
+   294→      onEmit: (e) => netRef.current?.emit('hunt:evt', e as HuntEvt),
+   295→    })
+   296→    engineRef.current = engine
+   297→
+   298→    // Room service — pairs the two devices and relays game events.
+   299→    const socket = io(`/?XTransformPort=${ROOM_SERVICE_PORT}`, {
+   300→      transports: ['websocket', 'polling'],
+   301→      reconnection: true,
+   302→      reconnectionAttempts: Infinity,
+   303→      reconnectionDelay: 1000,
+   304→      timeout: 10000,
+   305→    })
+   306→    netRef.current = socket
+   307→
+   308→    socket.on('connect', () => {
+   309→      if (mpStageRef.current === 'lobby' && !peerLinkedRef.current) {
+   310→        setMpStatus((s) => (s.startsWith('SIGNAL') ? 'CONTACTING THE DEEP…' : s))
+   311→      }
+   312→    })
+   313→    socket.on('hunt:ready', (p: ReadyPayload) => {
+   314→      roleRef.current = p.myRole
+   315→      setRole(p.myRole)
+   316→      setPeerLinked(true)
+   317→      peerLinkedRef.current = true
+   318→      setMpStatus('LINKED — DESCENDING…')
+   319→      showToast(p.myRole === 'monster' ? 'THE PREY HAS DESCENDED' : 'THE HUNTER IS LISTENING')
+   320→      if (isHostRef.current) {
+   321→        // The creator's client chooses the shared seed and starts the run.
+   322→        window.clearTimeout(startTimerRef.current)
+   323→        startTimerRef.current = window.setTimeout(() => {
+   324→          const seed = Math.floor(Math.random() * 1e9)
+   325→          socket.emit('hunt:evt', { t: 'start', seed } satisfies HuntEvt)
+   326→          startGame(seed)
+   327→        }, 1500)
+   328→      }
+   329→    })
+   330→    socket.on('hunt:evt', (e: HuntEvt) => {
+   331→      if (!e || typeof e !== 'object') return
+   332→      switch (e.t) {
+   333→        case 'start': {
+   334→          if (phaseRef.current !== 'playing') startGame(e.seed)
+   335→          break
+   336→        }
+   337→        case 'pos': {
+   338→          if (roleRef.current === 'monster') engine.setRemoteSurvivor(e.x, e.y, e.moving)
+   339→          else engine.setRemoteMonster(e.x, e.y, e.moving)
+   340→          break
+   341→        }
+   342→        case 'ping': {
+   343→          if (roleRef.current === 'monster') engine.netSurvivorPing(e.x, e.y)
+   344→          break
+   345→        }
+   346→        case 'click': {
+   347→          if (roleRef.current === 'survivor') engine.netMonsterClick(e.x, e.y)
+   348→          break
+   349→        }
+   350→        case 'keys': {
+   351→          setKeysFound(e.n)
+   352→          if (e.n >= 3) {
+   353→            audio.unlock()
+   354→            showToast('THE DOOR IS OPEN — STOP THEM')
+   355→          } else {
+   356→            showToast(`THE PREY FOUND A KEY — ${e.n}/3`)
+   357→          }
+   358→          break
+   359→        }
+   360→        case 'end': {
+   361→          // The survivor's client is authoritative — this verdict is final.
+   362→          const iAmHunter = roleRef.current === 'monster'
+   363→          const won = iAmHunter ? e.outcome === 'caught' : e.outcome === 'escaped'
+   364→          audio.setDanger(0)
+   365→          audio.setExitHum(0)
+   366→          if (e.outcome === 'caught') audio.win()
+   367→          else audio.death()
+   368→          window.clearTimeout(endDelayRef.current)
+   369→          setResult({ outcome: e.outcome, timeMs: e.timeMs, keysFound: e.keysFound, pings: e.pings })
+   370→          endDelayRef.current = window.setTimeout(() => {
+   371→            setPhase(won ? 'win' : 'dead')
+   372→            setMenuVisible(true)
+   373→          }, 1100)
+   374→          break
+   375→        }
+   376→        case 'rematch': {
+   377→          peerWantsRef.current = true
+   378→          setPeerWants(true)
+   379→          showToast('THE OTHER SIDE WANTS A REMATCH')
+   380→          if (iWantRef.current && isHostRef.current) {
+   381→            const seed = Math.floor(Math.random() * 1e9)
+   382→            socket.emit('hunt:evt', { t: 'start', seed } satisfies HuntEvt)
+   383→            startGame(seed)
+   384→          }
+   385→          break
+   386→        }
+   387→        case 'peer-lost': {
+   388→          peerLinkedRef.current = false
+   389→          setPeerLinked(false)
+   390→          if (phaseRef.current === 'playing') {
+   391→            setPeerLost(true)
+   392→          } else {
+   393→            setMpStatus('YOUR PARTNER VANISHED INTO THE DARK')
+   394→          }
+   395→          break
+   396→        }
+   397→      }
+   398→    })
+   399→
+   400→    try {
+   401→      const b = window.localStorage.getItem(BEST_KEY)
+   402→      if (b) queueMicrotask(() => setBest(Number(b)))
+   403→    } catch {
+   404→      /* ignore */
+   405→    }
+   406→    queueMicrotask(() => void loadEscapes())
+   407→
+   408→    const canvas = canvasRef.current
+   409→    const ctx = canvas?.getContext('2d')
+   410→
+   411→    const resize = () => {
+   412→      if (!canvas) return
+   413→      const dpr = window.devicePixelRatio || 1
+   414→      const w = canvas.clientWidth || window.innerWidth
+   415→      const h = canvas.clientHeight || window.innerHeight
+   416→      canvas.width = Math.round(w * dpr)
+   417→      canvas.height = Math.round(h * dpr)
+   418→    }
+   419→    resize()
+   420→    window.addEventListener('resize', resize)
+   421→
+   422→    let raf = 0
+   423→    let last = performance.now()
+   424→    let netFrame = 0
+   425→    const loop = (ts: number) => {
+   426→      const dt = Math.min(0.05, (ts - last) / 1000)
+   427→      last = ts
+   428→      // Merge keyboard + joystick into the engine input.
+   429→      const ks = keysStateRef.current
+   430→      let kx = 0
+   431→      let ky = 0
+   432→      if (ks.has('KeyD') || ks.has('d') || ks.has('ArrowRight')) kx += 1
+   433→      if (ks.has('KeyA') || ks.has('a') || ks.has('ArrowLeft')) kx -= 1
+   434→      if (ks.has('KeyS') || ks.has('s') || ks.has('ArrowDown')) ky += 1
+   435→      if (ks.has('KeyW') || ks.has('w') || ks.has('ArrowUp')) ky -= 1
+   436→      let ix = kx + joyRef.current.x
+   437→      let iy = ky + joyRef.current.y
+   438→      const il = Math.hypot(ix, iy)
+   439→      if (il > 1) {
+   440→        ix /= il
+   441→        iy /= il
+   442→      }
+   443→      engine.input.x = ix
+   444→      engine.input.y = iy
+   445→
+   446→      if (ctx) {
+   447→        if (phaseRef.current !== 'menu') engine.update(dt)
+   448→        const dpr = window.devicePixelRatio || 1
+   449→        const cw = canvas ? canvas.width / dpr : 0
+   450→        const ch = canvas ? canvas.height / dpr : 0
+   451→        engine.render(ctx, cw, ch, dpr)
+   452→      }
+   453→      if (timerRef.current && phaseRef.current === 'playing') {
+   454→        timerRef.current.textContent = fmt(engine.elapsedMs)
+   455→      }
+   456→      // Stream the local body to the partner at ~15 Hz.
+   457→      netFrame++
+   458→      if (
+   459→        mpActiveRef.current &&
+   460→        phaseRef.current === 'playing' &&
+   461→        netFrame % 4 === 0 &&
+   462→        netRef.current?.connected
+   463→      ) {
+   464→        const p = engine.playerPos
+   465→        const moving = Math.hypot(engine.input.x, engine.input.y) > 0.08
+   466→        netRef.current.emit('hunt:evt', {
+   467→          t: 'pos',
+   468→          x: Math.round(p.x * 10) / 10,
+   469→          y: Math.round(p.y * 10) / 10,
+   470→          moving,
+   471→        } satisfies HuntEvt)
+   472→      }
+   473→      // Drop any held controls when the run ends so the player
+   474→      // never keeps sliding into the dark after death.
+   475→      if (phaseRef.current !== 'playing') resetJoy()
+   476→      raf = requestAnimationFrame(loop)
+   477→    }
+   478→    raf = requestAnimationFrame(loop)
+   479→
+   480→    const onKeyDown = (e: KeyboardEvent) => {
+   481→      if (
+   482→        ['Space', 'ArrowUp', 'ArrowDown', 'ArrowLeft', 'ArrowRight'].includes(e.code) ||
+   483→        [' ', 'arrowup', 'arrowdown', 'arrowleft', 'arrowright'].includes(e.key.toLowerCase())
+   484→      ) {
+   485→        e.preventDefault()
+   486→      }
+   487→      if (e.repeat) return
+   488→      keysStateRef.current.add(e.code)
+   489→      keysStateRef.current.add(e.key === ' ' ? 'space' : e.key.toLowerCase())
+   490→      const k = e.key.toLowerCase()
+   491→      if (e.code === 'Space' || e.key === ' ' || k === 'enter') {
+   492→        if (phaseRef.current === 'menu') {
+   493→          if (mpStageRef.current === 'off') startGame()
+   494→        } else if (phaseRef.current === 'playing') engine.ping()
+   495→        else {
+   496→          if (mpActiveRef.current) requestRematch()
+   497→          else startGame()
+   498→        }
+   499→      }
+   500→      if (k === 'r' && (phaseRef.current === 'dead' || phaseRef.current === 'win')) {
+   501→        if (mpActiveRef.current) requestRematch()
+   502→        else startGame()
+   503→      }
+   504→    }
+   505→    const onKeyUp = (e: KeyboardEvent) => {
+   506→      keysStateRef.current.delete(e.code)
+   507→      keysStateRef.current.delete(e.key === ' ' ? 'space' : e.key.toLowerCase())
+   508→    }
+   509→    const onBlur = () => {
+   510→      keysStateRef.current.clear()
+   511→      joyRef.current = { x: 0, y: 0, active: false }
+   512→    }
+   513→
+   514→    window.addEventListener('keydown', onKeyDown)
+   515→    window.addEventListener('keyup', onKeyUp)
+   516→    window.addEventListener('blur', onBlur)
+   517→
+   518→    return () => {
+   519→      cancelAnimationFrame(raf)
+   520→      window.removeEventListener('resize', resize)
+   521→      window.removeEventListener('keydown', onKeyDown)
+   522→      window.removeEventListener('keyup', onKeyUp)
+   523→      window.removeEventListener('blur', onBlur)
+   524→      window.clearTimeout(toastTimeoutRef.current)
+   525→      window.clearTimeout(endDelayRef.current)
+   526→      window.clearTimeout(startTimerRef.current)
+   527→      socket.disconnect()
+   528→      audio.dispose()
+   529→    }
+   530→  }, [handleEnd, loadEscapes, requestRematch, resetJoy, showToast, startGame])
+   531→
+   532→  // ------------------------------------------------------------- pointer
+   533→  const onCanvasPointerDown = (e: React.PointerEvent) => {
+   534→    if (e.pointerType === 'touch') setTouchMode(true)
+   535→    if (phaseRef.current === 'playing') {
+   536→      e.preventDefault()
+   537→      engineRef.current?.ping()
+   538→    }
+   539→  }
+   540→
+   541→  // ------------------------------------------------------------- joystick
+   542→  const onJoyDown = (e: React.PointerEvent) => {
+   543→    e.stopPropagation()
+   544→    e.preventDefault()
+   545→    setTouchMode(true)
+   546→    const el = e.currentTarget
+   547→    const rect = el.getBoundingClientRect()
+   548→    joyCenterRef.current = { x: rect.left + rect.width / 2, y: rect.top + rect.height / 2 }
+   549→    joyIdRef.current = e.pointerId
+   550→    // Capture on the pad itself so the drag keeps tracking even when the
+   551→    // finger slides off it, and the browser cannot steal the gesture.
+   552→    try {
+   553→      el.setPointerCapture(e.pointerId)
+   554→    } catch {
+   555→      /* very old browsers */
+   556→    }
+   557→    updateJoy(e)
+   558→  }
+   559→  const onJoyMove = (e: React.PointerEvent) => {
+   560→    if (joyIdRef.current !== e.pointerId) return
+   561→    e.stopPropagation()
+   562→    updateJoy(e)
+   563→  }
+   564→  const onJoyUp = (e: React.PointerEvent) => {
+   565→    if (joyIdRef.current !== e.pointerId) return
+   566→    e.stopPropagation()
+   567→    resetJoy()
+   568→  }
+   569→  // Safety net: if the browser steals the pointer mid-drag (gesture,
+   570→  // notification, palm rejection) the stick must not stay stuck.
+   571→  const onJoyLostCapture = (e: React.PointerEvent) => {
+   572→    if (joyIdRef.current !== e.pointerId) return
+   573→    resetJoy()
+   574→  }
+   575→  const updateJoy = (e: React.PointerEvent) => {
+   576→    const dx = e.clientX - joyCenterRef.current.x
+   577→    const dy = e.clientY - joyCenterRef.current.y
+   578→    const max = 44
+   579→    const d = Math.hypot(dx, dy)
+   580→    const k = d > max ? max / d : 1
+   581→    // Deadzone: ignore finger jitter near the center, then remap the
+   582→    // remaining travel so a firm push always means full speed.
+   583→    const DEAD = 0.18
+   584→    const v = Math.min(1, d / max)
+   585→    const mag = v < DEAD ? 0 : Math.min(1, (v - DEAD) / (1 - DEAD))
+   586→    const n = d || 1
+   587→    joyRef.current = { x: (dx / n) * mag, y: (dy / n) * mag, active: mag > 0 }
+   588→    if (knobRef.current) {
+   589→      const kx = dx * k
+   590→      const ky = dy * k
+   591→      knobRef.current.style.transform = `translate(calc(-50% + ${kx}px), calc(-50% + ${ky}px))`
+   592→    }
+   593→  }
+   594→
+   595→  const playing = phase === 'playing'
+   596→
+   597→  return (
+   598→    <div
+   599→      ref={wrapRef}
+   600→      className="fixed inset-0 select-none overflow-hidden overscroll-none bg-black font-mono text-white"
+   601→    >
+   602→      <canvas
+   603→        ref={canvasRef}
+   604→        aria-label="The Sonar Room — echolocation game canvas"
+   605→        className="absolute inset-0 block h-full w-full cursor-crosshair touch-none bg-black"
+   606→        onPointerDown={onCanvasPointerDown}
+   607→        onContextMenu={(e) => e.preventDefault()}
+   608→      />
+   609→
+   610→      {/* ---------------- HUD (in-game) ---------------- */}
+   611→      {playing && (
+   612→        <div className="pointer-events-none absolute inset-0 z-10">
+   613→          {/* Keys */}
+   614→          <div
+   615→          className="absolute left-4 top-4 flex items-center gap-3 sm:left-6 sm:top-6"
+   616→        >
+   617→          <span className="sr-only">Keys collected: {keysFound} of 3</span>
+   618→          <div className="flex items-center gap-2" aria-hidden>
+   619→            {[0, 1, 2].map((i) => (
+   620→              <div
+   621→                key={i}
+   622→                className={`h-2.5 w-2.5 rotate-45 border transition-all duration-300 ${
+   623→                  i < keysFound ? 'border-white bg-white shadow-[0_0_8px_rgba(255,255,255,0.8)]' : 'border-white/40'
+   624→                }`}
+   625→              />
+   626→            ))}
+   627→          </div>
+   628→          <span className="text-[10px] tracking-[0.35em] text-white/40">
+   629→            {mpActiveRef.current && role === 'monster' ? 'PREY' : 'KEYS'}
+   630→          </span>
+   631→        </div>
+   632→          {/* Timer + link status */}
+   633→          <div className="absolute right-4 top-4 flex items-center gap-3 sm:right-6 sm:top-6">
+   634→            {mpActiveRef.current && (
+   635→              <span
+   636→                aria-label={peerLinked ? 'Partner connected' : 'Partner disconnected'}
+   637→                className={`h-1.5 w-1.5 rounded-full ${peerLinked ? 'bg-white/80' : 'animate-pulse bg-white/30'}`}
+   638→              />
+   639→            )}
+   640→            <span ref={timerRef} className="text-xs tracking-[0.3em] text-white/45">
+   641→              00:00
+   642→            </span>
+   643→          </div>
+   644→          {/* Hint */}
+   645→          <div
+   646→            className={`absolute left-1/2 -translate-x-1/2 text-center text-[10px] text-white/50 sm:text-xs ${
+   647→              touchMode ? 'bottom-48 tracking-[0.2em]' : 'bottom-8 tracking-[0.3em] sm:tracking-[0.3em]'
+   648→            }`}
+   649→            style={{ animation: 'hint-fade 9s ease-out forwards' }}
+   650→          >
+   651→            {touchMode ? (
+   652→              <>
+   653→                TAP — {role === 'monster' && mpActiveRef.current ? 'CLICK' : 'PING'}
+   654→                <br />
+   655→                STICK — MOVE
+   656→              </>
+   657→            ) : (
+   658→              <>
+   659→                CLICK / SPACE — {role === 'monster' && mpActiveRef.current ? 'ECHOCLICK' : 'PING'}
+   660→              </>
+   661→            )}
+   662→            <br />
+   663→            <span className="text-white/30">EVERY SOUND ECHOES. IT LISTENS.</span>
+   664→          </div>
+   665→          {/* Toast */}
+   666→          {toast && (
+   667→            <div
+   668→              className="absolute left-1/2 top-[22%] -translate-x-1/2 whitespace-nowrap text-center text-xs tracking-[0.5em] text-white sm:text-sm"
+   669→              style={{ animation: 'toast-in 2.6s ease-out forwards' }}
+   670→            >
+   671→              {toast}
+   672→            </div>
+   673→          )}
+   674→        </div>
+   675→      )}
+   676→
+   677→      {/* ---------------- Touch joystick ---------------- */}
+   678→      {playing && touchMode && (
+   679→        <div
+   680→          className="absolute bottom-3 left-2 z-20 flex h-44 w-44 touch-none select-none items-center justify-center rounded-full sm:bottom-6 sm:left-5"
+   681→          onPointerDown={onJoyDown}
+   682→          onPointerMove={onJoyMove}
+   683→          onPointerUp={onJoyUp}
+   684→          onPointerCancel={onJoyUp}
+   685→          onLostPointerCapture={onJoyLostCapture}
+   686→          aria-label="Movement joystick"
+   687→          role="application"
+   688→        >
+   689→          <div className="pointer-events-none h-32 w-32 rounded-full border border-white/20 bg-white/[0.02]" />
+   690→          <div
+   691→            ref={knobRef}
+   692→            className="pointer-events-none absolute left-1/2 top-1/2 h-12 w-12 -translate-x-1/2 -translate-y-1/2 rounded-full border border-white/40 bg-white/10 transition-transform duration-75"
+   693→          />
+   694→        </div>
+   695→      )}
+   696→
+   697→      {/* ---------------- MENU ---------------- */}
+   698→      {phase === 'menu' && menuVisible && (
+   699→        <div className="absolute inset-0 z-30 flex flex-col items-center justify-center overflow-y-auto bg-black/95 px-6 py-10">
+   700→          {/* ambient ping rings */}
+   701→          <div className="pointer-events-none absolute left-1/2 top-1/2 -translate-x-1/2 -translate-y-1/2" aria-hidden>
+   702→            <div
+   703→              className="absolute left-1/2 top-1/2 h-64 w-64 rounded-full border border-white/15"
+   704→              style={{ animation: 'sonar-ring 3.2s ease-out infinite' }}
+   705→            />
+   706→            <div
+   707→              className="absolute left-1/2 top-1/2 h-64 w-64 rounded-full border border-white/10"
+   708→              style={{ animation: 'sonar-ring 3.2s ease-out 1.6s infinite' }}
+   709→            />
+   710→          </div>
+   711→
+   712→          <p className="mb-4 text-[10px] tracking-[0.6em] text-white/35">
+   713→            A GAME OF ECHOLOCATION
+   714→          </p>
+   715→          <h1
+   716→            className="mb-3 text-center text-3xl font-light tracking-[0.45em] sm:text-5xl"
+   717→            style={{ animation: 'flicker 5s linear infinite' }}
+   718→          >
+   719→            THE SONAR ROOM
+   720→          </h1>
+   721→          <p className="mb-10 text-center text-xs tracking-[0.3em] text-white/50">
+   722→            YOU ARE BLIND. SOUND IS SIGHT.
+   723→          </p>
+   724→
+   725→          <div className="mb-10 w-full max-w-sm space-y-2.5 border border-white/10 p-5 text-[11px] tracking-[0.2em] text-white/60">
+   726→            <div className="flex items-center justify-between gap-4">
+   727→              <span className="text-white/85">{touchMode ? 'TAP SCREEN' : 'CLICK / SPACE'}</span>
+   728→              <span>EMIT SONAR PING</span>
+   729→            </div>
+   730→            <div className="flex items-center justify-between gap-4">
+   731→              <span className="text-white/85">{touchMode ? 'LEFT STICK' : 'W A S D'}</span>
+   732→              <span>MOVE</span>
+   733→            </div>
+   734→            <div className="flex items-center justify-between gap-4">
+   735→              <span className="tracking-[0.5em] text-white/85">◆ ◆ ◆</span>
+   736→              <span>FIND 3 KEYS</span>
+   737→            </div>
+   738→            <div className="flex items-center justify-between gap-4">
+   739→              <span className="text-white/85">THE DOOR</span>
+   740→              <span>ESCAPE</span>
+   741→            </div>
+   742→            <div className="mt-3 border-t border-white/10 pt-3 text-center text-[10px] leading-relaxed text-white/40">
+   743→              THE RINGS REVEAL THE WALLS FOR A MOMENT.
+   744→              <br />
+   745→              SOMETHING ELSE HEARS EVERY PING YOU MAKE.
+   746→            </div>
+   747→          </div>
+   748→
+   749→          <button
+   750→            onClick={() => startGame()}
+   751→            className="border border-white/50 px-12 py-3.5 text-sm tracking-[0.5em] transition-colors duration-200 hover:bg-white hover:text-black focus:outline-none focus:ring-1 focus:ring-white"
+   752→          >
+   753→            BEGIN
+   754→          </button>
+   755→
+   756→          {mpStage === 'off' && (
+   757→            <button
+   758→              onClick={() => setMpStageBoth('choose')}
+   759→              className="mt-4 border border-white/20 px-10 py-2.5 text-[11px] tracking-[0.45em] text-white/55 transition-colors duration-200 hover:border-white/60 hover:text-white focus:outline-none focus:ring-1 focus:ring-white/40"
+   760→            >
+   761→              HUNT · TWO PLAYERS
+   762→            </button>
+   763→          )}
+   764→
+   765→          {mpStage !== 'off' && (
+   766→            <div className="mt-6 w-full max-w-sm border border-white/10 p-5 text-[11px] tracking-[0.25em]">
+   767→              {mpStage === 'choose' && (
+   768→                <>
+   769→                  <p className="mb-4 text-center text-[10px] tracking-[0.4em] text-white/40">
+   770→                    TWO DEVICES · ONE CODE · ONE SURVIVOR
+   771→                  </p>
+   772→                  <div className="flex flex-col gap-2">
+   773→                    <button
+   774→                      onClick={() => setMpStageBoth('pick')}
+   775→                      className="border border-white/25 px-6 py-3 tracking-[0.35em] transition-colors duration-200 hover:border-white hover:bg-white hover:text-black"
+   776→                    >
+   777→                      CREATE A ROOM
+   778→                    </button>
+   779→                    <button
+   780→                      onClick={() => setMpStageBoth('join')}
+   781→                      className="border border-white/25 px-6 py-3 tracking-[0.35em] transition-colors duration-200 hover:border-white hover:bg-white hover:text-black"
+   782→                    >
+   783→                      JOIN A ROOM
+   784→                    </button>
+   785→                  </div>
+   786→                  <button
+   787→                    onClick={() => setMpStageBoth('off')}
+   788→                    className="mt-4 w-full text-center text-[10px] tracking-[0.4em] text-white/30 hover:text-white/70"
+   789→                  >
+   790→                    BACK
+   791→                  </button>
+   792→                </>
+   793→              )}
+   794→
+   795→              {mpStage === 'pick' && (
+   796→                <>
+   797→                  <p className="mb-4 text-center text-[10px] tracking-[0.4em] text-white/40">
+   798→                    CHOOSE YOUR SIDE
+   799→                  </p>
+   800→                  <div className="flex flex-col gap-2">
+   801→                    <button
+   802→                      onClick={() => beginCreate('survivor')}
+   803→                      className="border border-white/25 px-6 py-3 text-left transition-colors duration-200 hover:border-white hover:bg-white hover:text-black"
+   804→                    >
+   805→                      <span className="tracking-[0.35em]">THE PREY</span>
+   806→                      <span className="block pt-1 text-[9px] tracking-[0.2em] opacity-60">
+   807→                        FIND 3 KEYS · REACH THE DOOR · STAY QUIET
+   808→                      </span>
+   809→                    </button>
+   810→                    <button
+   811→                      onClick={() => beginCreate('monster')}
+   812→                      className="border border-white/25 px-6 py-3 text-left transition-colors duration-200 hover:border-white hover:bg-white hover:text-black"
+   813→                    >
+   814→                      <span className="tracking-[0.35em]">THE HUNTER</span>
+   815→                      <span className="block pt-1 text-[9px] tracking-[0.2em] opacity-60">
+   816→                        BLIND TOO · TRACK THEIR PINGS AND FOOTSTEPS · KILL
+   817→                      </span>
+   818→                    </button>
+   819→                  </div>
+   820→                  <button
+   821→                    onClick={() => setMpStageBoth('choose')}
+   822→                    className="mt-4 w-full text-center text-[10px] tracking-[0.4em] text-white/30 hover:text-white/70"
+   823→                  >
+   824→                    BACK
+   825→                  </button>
+   826→                </>
+   827→              )}
+   828→
+   829→              {mpStage === 'join' && (
+   830→                <>
+   831→                  <p className="mb-4 text-center text-[10px] tracking-[0.4em] text-white/40">
+   832→                    ENTER THE ROOM CODE
+   833→                  </p>
+   834→                  <input
+   835→                    value={joinInput}
+   836→                    onChange={(e) =>
+   837→                      setJoinInput(
+   838→                        e.target.value.toUpperCase().replace(/[^A-Z0-9]/g, '').slice(0, 4),
+   839→                      )
+   840→                    }
+   841→                    onKeyDown={(e) => {
+   842→                      if (e.key === 'Enter') doJoin()
+   843→                    }}
+   844→                    placeholder="· · · ·"
+   845→                    aria-label="Room code"
+   846→                    className="w-full border border-white/25 bg-transparent px-4 py-3 text-center text-2xl tracking-[0.6em] text-white placeholder:text-white/20 focus:border-white focus:outline-none"
+   847→                  />
+   848→                  {mpError && (
+   849→                    <p className="mt-3 text-center text-[10px] tracking-[0.3em] text-white/70">
+   850→                      {mpError}
+   851→                    </p>
+   852→                  )}
+   853→                  <button
+   854→                    onClick={doJoin}
+   855→                    disabled={joinInput.length !== 4}
+   856→                    className="mt-3 w-full border border-white/25 px-6 py-3 tracking-[0.35em] transition-colors duration-200 hover:border-white hover:bg-white hover:text-black disabled:opacity-30 disabled:hover:bg-transparent disabled:hover:text-white"
+   857→                  >
+   858→                    DESCEND TOGETHER
+   859→                  </button>
+   860→                  <button
+   861→                    onClick={() => setMpStageBoth('choose')}
+   862→                    className="mt-4 w-full text-center text-[10px] tracking-[0.4em] text-white/30 hover:text-white/70"
+   863→                  >
+   864→                    BACK
+   865→                  </button>
+   866→                </>
+   867→              )}
+   868→
+   869→              {mpStage === 'lobby' && (
+   870→                <>
+   871→                  <p className="text-center text-[10px] tracking-[0.4em] text-white/40">
+   872→                    ROOM CODE
+   873→                  </p>
+   874→                  <p className="my-4 text-center text-4xl font-light tracking-[0.55em] text-white">
+   875→                    {roomCode}
+   876→                  </p>
+   877→                  <button
+   878→                    onClick={() => {
+   879→                      if (!roomCode) return
+   880→                      try {
+   881→                        void navigator.clipboard?.writeText(roomCode)
+   882→                        setCopied(true)
+   883→                        window.setTimeout(() => setCopied(false), 1600)
+   884→                      } catch {
+   885→                        /* clipboard unavailable */
+   886→                      }
+   887→                    }}
+   888→                    className="mx-auto block border border-white/20 px-6 py-2 text-[10px] tracking-[0.4em] text-white/60 transition-colors duration-200 hover:border-white/60 hover:text-white"
+   889→                  >
+   890→                    {copied ? 'COPIED' : 'COPY CODE'}
+   891→                  </button>
+   892→                  <p
+   893→                    aria-live="polite"
+   894→                    className={`mt-5 text-center text-[10px] leading-relaxed tracking-[0.3em] ${
+   895→                      peerLinked ? 'text-white' : 'animate-pulse text-white/45'
+   896→                    }`}
+   897→                  >
+   898→                    {mpStatus}
+   899→                  </p>
+   900→                  <p className="mt-3 text-center text-[9px] leading-relaxed tracking-[0.25em] text-white/30">
+   901→                    {role === 'monster'
+   902→                      ? 'YOU ARE THE HUNTER. YOU ARE BLIND TOO — TRACK THEIR PINGS.'
+   903→                      : role === 'survivor'
+   904→                        ? 'YOU ARE THE PREY. EVERY PING YOU MAKE BETRAYS YOU.'
+   905→                        : ''}
+   906→                  </p>
+   907→                  {!peerLinked && (
+   908→                    <button
+   909→                      onClick={exitMp}
+   910→                      className="mt-4 w-full text-center text-[10px] tracking-[0.4em] text-white/30 hover:text-white/70"
+   911→                    >
+   912→                      CANCEL
+   913→                    </button>
+   914→                  )}
+   915→                </>
+   916→              )}
+   917→            </div>
+   918→          )}
+   919→
+   920→          <div className="mt-8 flex flex-col items-center gap-1.5 text-[10px] tracking-[0.25em] text-white/30">
+   921→            {best !== null && <span>BEST ESCAPE — {fmt(best)}</span>}
+   922→            <span>HEADPHONES STRONGLY RECOMMENDED</span>
+   923→          </div>
+   924→        </div>
+   925→      )}
+   926→
+   927→      {/* ---------------- PEER LOST (multiplayer) ---------------- */}
+   928→      {peerLost && (
+   929→        <div className="absolute inset-0 z-40 flex flex-col items-center justify-center bg-black/95 px-6">
+   930→          <h2 className="mb-4 text-2xl font-light tracking-[0.5em] sm:text-3xl">
+   931→            THE LINK IS SEVERED
+   932→          </h2>
+   933→          <p className="mb-10 text-center text-[11px] tracking-[0.3em] leading-relaxed text-white/50">
+   934→            YOUR PARTNER VANISHED INTO THE DARK.
+   935→          </p>
+   936→          <button
+   937→            onClick={exitMp}
+   938→            className="border border-white/50 px-10 py-3 text-sm tracking-[0.45em] transition-colors duration-200 hover:bg-white hover:text-black focus:outline-none focus:ring-1 focus:ring-white"
+   939→          >
+   940→            BACK TO THE MENU
+   941→          </button>
+   942→        </div>
+   943→      )}
+   944→
+   945→      {/* ---------------- DEATH ---------------- */}
+   946→      {phase === 'dead' && result && (
+   947→        <div className="absolute inset-0 z-30 flex flex-col items-center justify-center bg-black/90 px-6">
+   948→          <h2 className="mb-6 text-3xl font-light tracking-[0.5em] sm:text-4xl">
+   949→            {mpActiveRef.current && role === 'monster' ? 'THE PREY ESCAPED' : 'IT FOUND YOU'}
+   950→          </h2>
+   951→          <div className="mb-10 space-y-1.5 text-center text-[11px] tracking-[0.3em] text-white/50">
+   952→            {mpActiveRef.current && role === 'monster' ? (
+   953→              <p>THE HUNT LASTED {fmt(result.timeMs)}</p>
+   954→            ) : (
+   955→              <p>ENDURED {fmt(result.timeMs)}</p>
+   956→            )}
+   957→            <p>
+   958→              KEYS {result.keysFound}/3 · PINGS {result.pings}
+   959→            </p>
+   960→          </div>
+   961→          {mpActiveRef.current ? (
+   962→            <>
+   963→              <button
+   964→                onClick={requestRematch}
+   965→                className="border border-white/50 px-10 py-3 text-sm tracking-[0.45em] transition-colors duration-200 hover:bg-white hover:text-black focus:outline-none focus:ring-1 focus:ring-white"
+   966→              >
+   967→                {iWant && peerWants ? 'RESTARTING…' : iWant ? 'WAITING FOR YOUR PARTNER…' : 'REMATCH'}
+   968→              </button>
+   969→              <button
+   970→                onClick={exitMp}
+   971→                className="mt-4 text-[10px] tracking-[0.4em] text-white/30 transition-colors hover:text-white/70"
+   972→              >
+   973→                BACK TO THE MENU
+   974→              </button>
+   975→            </>
+   976→          ) : (
+   977→            <>
+   978→              <button
+   979→                onClick={() => startGame()}
+   980→                className="border border-white/50 px-10 py-3 text-sm tracking-[0.45em] transition-colors duration-200 hover:bg-white hover:text-black focus:outline-none focus:ring-1 focus:ring-white"
+   981→              >
+   982→                TRY AGAIN
+   983→              </button>
+   984→              <p className="mt-5 text-[10px] tracking-[0.3em] text-white/25">PRESS R</p>
+   985→            </>
+   986→          )}
+   987→        </div>
+   988→      )}
+   989→
+   990→      {/* ---------------- WIN ---------------- */}
+   991→      {phase === 'win' && result && (
+   992→        <div className="absolute inset-0 z-30 flex flex-col items-center justify-center overflow-y-auto bg-black/92 px-6 py-10">
+   993→          <h2 className="mb-2 text-3xl font-light tracking-[0.5em] sm:text-4xl">
+   994→            {mpActiveRef.current && role === 'monster' ? 'PREY SLAIN' : 'YOU ESCAPED'}
+   995→          </h2>
+   996→          <p className="mb-8 text-xs tracking-[0.4em] text-white/50">
+   997→            {mpActiveRef.current && role === 'monster'
+   998→              ? `THE HUNT LASTED ${fmt(result.timeMs)}`
+   999→              : `${fmt(result.timeMs)} · ${result.pings} PINGS`}
+  1000→          </p>
+  1001→
+  1002→          {!mpActiveRef.current && best !== null && (
+  1003→            <p className="mb-8 text-[11px] tracking-[0.35em] text-white/70">
+  1004→              BEST ESCAPE — {fmt(best)}
+  1005→            </p>
+  1006→          )}
+  1007→
+  1008→          {!mpActiveRef.current && escapes.length > 0 && (
+  1009→            <div className="mb-10 w-full max-w-xs border border-white/10 p-4">
+  1010→              <p className="mb-3 text-center text-[10px] tracking-[0.4em] text-white/40">
+  1011→                FASTEST ESCAPES
+  1012→              </p>
+  1013→              <div className="space-y-1.5 text-[11px] tracking-[0.15em] text-white/60">
+  1014→                {escapes.map((e, i) => (
+  1015→                  <div key={i} className="flex items-center justify-between gap-3">
+  1016→                    <span className="text-white/35">{String(i + 1).padStart(2, '0')}</span>
+  1017→                    <span className="text-white/85">{fmt(e.timeMs)}</span>
+  1018→                    <span className="text-white/30">{e.pings} P</span>
+  1019→                  </div>
+  1020→                ))}
+  1021→              </div>
+  1022→            </div>
+  1023→          )}
+  1024→
+  1025→          {mpActiveRef.current ? (
+  1026→            <>
+  1027→              <button
+  1028→                onClick={requestRematch}
+  1029→                className="border border-white/50 px-10 py-3 text-sm tracking-[0.45em] transition-colors duration-200 hover:bg-white hover:text-black focus:outline-none focus:ring-1 focus:ring-white"
+  1030→              >
+  1031→                {iWant && peerWants ? 'RESTARTING…' : iWant ? 'WAITING FOR YOUR PARTNER…' : 'REMATCH'}
+  1032→              </button>
+  1033→              <button
+  1034→                onClick={exitMp}
+  1035→                className="mt-4 text-[10px] tracking-[0.4em] text-white/30 transition-colors hover:text-white/70"
+  1036→              >
+  1037→                BACK TO THE MENU
+  1038→              </button>
+  1039→            </>
+  1040→          ) : (
+  1041→            <>
+  1042→              <button
+  1043→                onClick={() => startGame()}
+  1044→                className="border border-white/50 px-10 py-3 text-sm tracking-[0.45em] transition-colors duration-200 hover:bg-white hover:text-black focus:outline-none focus:ring-1 focus:ring-white"
+  1045→              >
+  1046→                DESCEND AGAIN
+  1047→              </button>
+  1048→              <p className="mt-5 text-[10px] tracking-[0.3em] text-white/25">PRESS R</p>
+  1049→            </>
+  1050→          )}
+  1051→        </div>
+  1052→      )}
+  1053→    </div>
+  1054→  )
+  1055→}
+  1056→

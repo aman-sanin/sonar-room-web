@@ -1,0 +1,1053 @@
+     1→     1→// The Sonar Room — core game engine.
+     2→     2→// You are blind: the world only exists for the ~1.5s a ping takes to fade.
+     3→     3→// Pings expand as wavefronts; where they touch wall segments the wireframe
+     4→     4→// blinks into existence. Sound is spatialized. The thing in the dark hears
+     5→     5→// every ping you make.
+     6→     6→
+     7→     7→import {
+     8→     8→  GameMap,
+     9→     9→  Vec,
+    10→    10→  Cell,
+    11→    11→  generateMap,
+    12→    12→  bfsPath,
+    13→    13→  cellCenter,
+    14→    14→  isSolid,
+    15→    15→  nearestOpenCell,
+    16→    16→  segDist,
+    17→    17→  worldToCell,
+    18→    18→} from './maze'
+    19→    19→import { SoundEngine } from './audio'
+    20→    20→
+    21→    21→export type EnginePhase = 'idle' | 'playing' | 'dead' | 'win'
+    22→    22→
+    23→    23→export interface RunResult {
+    24→    24→  outcome: 'escaped' | 'caught'
+    25→    25→  timeMs: number
+    26→    26→  keysFound: number
+    27→    27→  pings: number
+    28→    28→}
+    29→    29→
+    30→    30→export interface EngineHooks {
+    31→    31→  onKeys?: (n: number) => void
+    32→    32→  onToast?: (msg: string) => void
+    33→    33→  onEnd?: (r: RunResult) => void
+    34→    34→  /** Multiplayer: events the engine asks the component to relay to the peer. */
+    35→    35→  onEmit?: (e: HuntEmit) => void
+    36→    36→}
+    37→    37→
+    38→    38→/** solo = vs AI · host = survivor, monster is remote · hunter = you are the monster. */
+    39→    39→export type EngineMode = 'solo' | 'host' | 'hunter'
+    40→    40→
+    41→    41→export type HuntEmit =
+    42→    42→  | { t: 'ping'; x: number; y: number }
+    43→    43→  | { t: 'click'; x: number; y: number }
+    44→    44→
+    45→    45→interface Ping {
+    46→    46→  ox: number
+    47→    47→  oy: number
+    48→    48→  r: number
+    49→    49→  maxR: number
+    50→    50→  speed: number
+    51→    51→  owner: 0 | 1 // 0 = player, 1 = monster/door (dimmer, silent reveal)
+    52→    52→  hits: Uint8Array
+    53→    53→  doorHit: boolean
+    54→    54→  jag: number[]
+    55→    55→  dead: boolean
+    56→    56→}
+    57→    57→
+    58→    58→type MonsterState = 'dormant' | 'wander' | 'investigate' | 'chase'
+    59→    59→
+    60→    60→interface Monster {
+    61→    61→  x: number
+    62→    62→  y: number
+    63→    63→  state: MonsterState
+    64→    64→  path: Vec[]
+    65→    65→  pathI: number
+    66→    66→  target: Cell | null
+    67→    67→  repath: number
+    68→    68→  lost: number
+    69→    69→  growlT: number
+    70→    70→  clickT: number
+    71→    71→  stepT: number
+    72→    72→  pendingAt: number
+    73→    73→  pendingX: number
+    74→    74→  pendingY: number
+    75→    75→  revealT: number
+    76→    76→  lastPX: number
+    77→    77→  lastPY: number
+    78→    78→  /** Multiplayer: latest peer-reported position to ease toward. */
+    79→    79→  netX: number
+    80→    80→  netY: number
+    81→    81→  netMoving: boolean
+    82→    82→}
+    83→    83→
+    84→    84→interface KeyItem {
+    85→    85→  x: number
+    86→    86→  y: number
+    87→    87→  found: boolean
+    88→    88→  revealT: number
+    89→    89→  jT: number
+    90→    90→}
+    91→    91→
+    92→    92→const PING_MAX_R = 640
+    93→    93→const PING_SPEED = 500
+    94→    94→const PING_COOLDOWN = 1.05
+    95→    95→const PLAYER_SPEED = 152
+    96→    96→const PLAYER_R = 9
+    97→    97→const SENSE_R = 150 // monster senses you this close, ping or not
+    98→    98→const LOSE_R = 310 // break this far for long enough and it loses you
+    99→    99→const HEAR_R = 920 // it hears any ping made within this range
+   100→   100→const CATCH_R = 20
+   101→   101→const GRACE = 8 // seconds before the thing wakes up
+   102→   102→
+   103→   103→const clamp = (v: number, a: number, b: number): number => Math.max(a, Math.min(b, v))
+   104→   104→const expFade = (age: number, tau: number): number => Math.exp(-age / tau)
+   105→   105→
+   106→   106→export class SonarEngine {
+   107→   107→  map: GameMap | null = null
+   108→   108→  phase: EnginePhase = 'idle'
+   109→   109→  time = 0
+   110→   110→  cooldown = 0
+   111→   111→  pingsUsed = 0
+   112→   112→  keysFound = 0
+   113→   113→  unlocked = false
+   114→   114→  danger = 0
+   115→   115→  input = { x: 0, y: 0 }
+   116→   116→  mode: EngineMode = 'solo'
+   117→   117→
+   118→   118→  private player = { x: 0, y: 0 }
+   119→   119→  private cam = { x: 0, y: 0 }
+   120→   120→  private monster: Monster | null = null
+   121→   121→  private keys: KeyItem[] = []
+   122→   122→  private pings: Ping[] = []
+   123→   123→  private revealT: Float32Array = new Float32Array(0)
+   124→   124→  private revealS: Float32Array = new Float32Array(0)
+   125→   125→  private doorRevealT = -99
+   126→   126→  private shake = 0
+   127→   127→  private hbT = 0
+   128→   128→  private stepT = 0
+   129→   129→  private thudGate = 0
+   130→   130→  private screechGate = 0
+   131→   131→  private beaconT = 0
+   132→   132→  private graceAnnounced = false
+   133→   133→  private chaseAnnounced = false
+   134→   134→  private deathAt = 0
+   135→   135→  private winAt = 0
+   136→   136→  private seed = 1
+   137→   137→
+   138→   138→  constructor(
+   139→   139→    private audio: SoundEngine,
+   140→   140→    private hooks: EngineHooks = {},
+   141→   141→  ) {}
+   142→   142→
+   143→   143→  private panOf(x: number): number {
+   144→   144→    return clamp((x - this.player.x) / 300, -1, 1)
+   145→   145→  }
+   146→   146→
+   147→   147→  private volByDist(d: number, range: number): number {
+   148→   148→    return clamp(1 - d / range, 0, 1)
+   149→   149→  }
+   150→   150→
+   151→   151→  start(seed = Math.floor(Math.random() * 1e9)): void {
+   152→   152→    this.seed = seed
+   153→   153→    this.map = generateMap(seed)
+   154→   154→    const n = this.map.edges.length
+   155→   155→    this.revealT = new Float32Array(n).fill(-99)
+   156→   156→    this.revealS = new Float32Array(n)
+   157→   157→    // In hunter mode the LOCAL body is the monster; the "monster" slot
+   158→   158→    // holds the remote survivor ghost. Audio panning stays relative to
+   159→   159→    // the local body either way.
+   160→   160→    this.player = this.mode === 'hunter' ? { ...this.map.monsterStart } : { ...this.map.start }
+   161→   161→    this.cam = { ...this.player }
+   162→   162→    this.keys = this.map.keys.map((k) => ({ x: k.x, y: k.y, found: false, revealT: -99, jT: 1 + Math.random() * 2 }))
+   163→   163→    const m: Monster = {
+   164→   164→      x: this.mode === 'hunter' ? this.map.start.x : this.map.monsterStart.x,
+   165→   165→      y: this.mode === 'hunter' ? this.map.start.y : this.map.monsterStart.y,
+   166→   166→      state: 'dormant',
+   167→   167→      path: [],
+   168→   168→      pathI: 0,
+   169→   169→      target: null,
+   170→   170→      repath: 0,
+   171→   171→      lost: 0,
+   172→   172→      growlT: 2 + Math.random() * 3,
+   173→   173→      clickT: 3 + Math.random() * 3,
+   174→   174→      stepT: 0,
+   175→   175→      pendingAt: 0,
+   176→   176→      pendingX: 0,
+   177→   177→      pendingY: 0,
+   178→   178→      revealT: -99,
+   179→   179→      lastPX: 0,
+   180→   180→      lastPY: 0,
+   181→   181→      netX: 0,
+   182→   182→      netY: 0,
+   183→   183→      netMoving: false,
+   184→   184→    }
+   185→   185→    m.netX = m.x
+   186→   186→    m.netY = m.y
+   187→   187→    this.monster = m
+   188→   188→    this.pings = []
+   189→   189→    this.time = 0
+   190→   190→    this.cooldown = 0
+   191→   191→    this.pingsUsed = 0
+   192→   192→    this.keysFound = 0
+   193→   193→    this.unlocked = false
+   194→   194→    this.danger = 0
+   195→   195→    this.shake = 0
+   196→   196→    this.doorRevealT = -99
+   197→   197→    this.thudGate = 0
+   198→   198→    this.screechGate = 0
+   199→   199→    this.beaconT = 0
+   200→   200→    this.graceAnnounced = false
+   201→   201→    this.chaseAnnounced = false
+   202→   202→    this.phase = 'playing'
+   203→   203→    this.audio.setDanger(0)
+   204→   204→    this.audio.setExitHum(0)
+   205→   205→    this.hooks.onKeys?.(0)
+   206→   206→    this.hooks.onToast?.(
+   207→   207→      this.mode === 'hunter' ? 'SOMETHING FLESH IS IN THE DARK — LISTEN' : 'FIND THE KEYS — QUIETLY',
+   208→   208→    )
+   209→   209→  }
+   210→   210→
+   211→   211→  /** Emit a sonar ping — or, as the hunter, an echolocation click. Costs noise. */
+   212→   212→  ping(): boolean {
+   213→   213→    if (this.phase !== 'playing' || this.cooldown > 0 || !this.map) return false
+   214→   214→    this.cooldown = PING_COOLDOWN
+   215→   215→    this.pingsUsed++
+   216→   216→    if (this.mode === 'hunter') {
+   217→   217→      this.pings.push(this.makePing(this.player.x, this.player.y, 1, 430, 440))
+   218→   218→      this.audio.monsterClick(0, 0.32)
+   219→   219→      this.hooks.onEmit?.({ t: 'click', x: this.player.x, y: this.player.y })
+   220→   220→      return true
+   221→   221→    }
+   222→   222→    this.pings.push(this.makePing(this.player.x, this.player.y, 0, PING_MAX_R, PING_SPEED))
+   223→   223→    this.audio.ping()
+   224→   224→    if (this.mode === 'host') {
+   225→   225→      this.hooks.onEmit?.({ t: 'ping', x: this.player.x, y: this.player.y })
+   226→   226→    }
+   227→   227→    const m = this.monster
+   228→   228→    if (this.mode === 'solo' && m && m.state !== 'chase' && this.time > GRACE) {
+   229→   229→      const d = Math.hypot(this.player.x - m.x, this.player.y - m.y)
+   230→   230→      if (d < HEAR_R) {
+   231→   231→        m.pendingAt = this.time + 0.35
+   232→   232→        m.pendingX = this.player.x
+   233→   233→        m.pendingY = this.player.y
+   234→   234→      }
+   235→   235→    }
+   236→   236→    return true
+   237→   237→  }
+   238→   238→
+   239→   239→  private makePing(ox: number, oy: number, owner: 0 | 1, maxR: number, speed: number): Ping {
+   240→   240→    const jag: number[] = []
+   241→   241→    for (let i = 0; i < 48; i++) jag.push((Math.random() - 0.5) * 2)
+   242→   242→    return {
+   243→   243→      ox,
+   244→   244→      oy,
+   245→   245→      r: 2,
+   246→   246→      maxR,
+   247→   247→      speed,
+   248→   248→      owner,
+   249→   249→      hits: new Uint8Array(this.map ? this.map.edges.length : 0),
+   250→   250→      doorHit: false,
+   251→   251→      jag,
+   252→   252→      dead: false,
+   253→   253→    }
+   254→   254→  }
+   255→   255→
+   256→   256→  // ------------------------------------------------------------- collision
+   257→   257→
+   258→   258→  private hitsWall(x: number, y: number): boolean {
+   259→   259→    const map = this.map
+   260→   260→    if (!map) return false
+   261→   261→    const c0 = Math.floor((x - PLAYER_R) / map.cell)
+   262→   262→    const c1 = Math.floor((x + PLAYER_R) / map.cell)
+   263→   263→    const r0 = Math.floor((y - PLAYER_R) / map.cell)
+   264→   264→    const r1 = Math.floor((y + PLAYER_R) / map.cell)
+   265→   265→    for (let r = r0; r <= r1; r++) {
+   266→   266→      for (let c = c0; c <= c1; c++) {
+   267→   267→        if (!isSolid(map, c, r)) continue
+   268→   268→        const rx = c * map.cell
+   269→   269→        const ry = r * map.cell
+   270→   270→        const nx = clamp(x, rx, rx + map.cell)
+   271→   271→        const ny = clamp(y, ry, ry + map.cell)
+   272→   272→        if (Math.hypot(x - nx, y - ny) < PLAYER_R) return true
+   273→   273→      }
+   274→   274→    }
+   275→   275→    return false
+   276→   276→  }
+   277→   277→
+   278→   278→  // ---------------------------------------------------------------- update
+   279→   279→
+   280→   280→  update(dt: number): void {
+   281→   281→    this.time += dt
+   282→   282→    this.cooldown = Math.max(0, this.cooldown - dt)
+   283→   283→    this.thudGate -= dt
+   284→   284→    this.screechGate -= dt
+   285→   285→    this.shake = Math.max(0, this.shake - dt * 1.6)
+   286→   286→
+   287→   287→    this.updatePings(dt)
+   288→   288→
+   289→   289→    if (this.phase === 'playing') {
+   290→   290→      this.updatePlayer(dt)
+   291→   291→      if (this.mode === 'hunter') {
+   292→   292→        this.updateGhost(dt)
+   293→   293→        this.updateDanger(dt)
+   294→   294→      } else if (this.mode === 'host') {
+   295→   295→        this.updateRemoteMonster(dt)
+   296→   296→        this.updateKeys(dt)
+   297→   297→        this.updateExit(dt)
+   298→   298→        this.updateDanger(dt)
+   299→   299→      } else {
+   300→   300→        this.updateMonster(dt)
+   301→   301→        this.updateKeys(dt)
+   302→   302→        this.updateExit(dt)
+   303→   303→        this.updateDanger(dt)
+   304→   304→      }
+   305→   305→    } else {
+   306→   306→      this.danger = Math.max(0, this.danger - dt * 0.8)
+   307→   307→      this.audio.setDanger(this.danger)
+   308→   308→    }
+   309→   309→
+   310→   310→    // Camera follows.
+   311→   311→    const k = Math.min(1, dt * 4.5)
+   312→   312→    this.cam.x += (this.player.x - this.cam.x) * k
+   313→   313→    this.cam.y += (this.player.y - this.cam.y) * k
+   314→   314→  }
+   315→   315→
+   316→   316→  private updatePings(dt: number): void {
+   317→   317→    const map = this.map
+   318→   318→    if (!map) return
+   319→   319→    for (const p of this.pings) {
+   320→   320→      const rPrev = p.r
+   321→   321→      p.r = Math.min(p.maxR, p.r + p.speed * dt)
+   322→   322→      if (p.owner === 0 || p.owner === 1) {
+   323→   323→        // Edge crossings.
+   324→   324→        let soundBudget = 2
+   325→   325→        for (let i = 0; i < map.edges.length; i++) {
+   326→   326→          if (p.hits[i]) continue
+   327→   327→          const e = map.edges[i]
+   328→   328→          const mx = (e.x1 + e.x2) / 2
+   329→   329→          const my = (e.y1 + e.y2) / 2
+   330→   330→          // Cheap reject by bounding box.
+   331→   331→          const bx = Math.min(e.x1, e.x2) - p.r
+   332→   332→          if (p.ox < bx || p.ox > Math.max(e.x1, e.x2) + p.r) {
+   333→   333→            if (Math.abs(p.ox - mx) > p.r) continue
+   334→   334→          }
+   335→   335→          const d = segDist(p.ox, p.oy, e.x1, e.y1, e.x2, e.y2)
+   336→   336→          if (d <= p.r && d > rPrev - 0.5) {
+   337→   337→            p.hits[i] = 1
+   338→   338→            const strength = clamp(1.08 - d / 720, 0.28, 1) * (p.owner === 1 ? 0.5 : 1)
+   339→   339→            if (strength > this.revealS[i] * expFade(this.time - this.revealT[i], 0.55)) {
+   340→   340→              this.revealS[i] = strength
+   341→   341→              this.revealT[i] = this.time
+   342→   342→            }
+   343→   343→            if (p.owner === 0 && this.phase === 'playing' && soundBudget > 0 && this.thudGate <= 0) {
+   344→   344→              const vol = strength * clamp(1.2 - d / 620, 0.2, 1) * 0.85
+   345→   345→              this.audio.thud(this.panOf(mx), vol)
+   346→   346→              soundBudget--
+   347→   347→              this.thudGate = 0.045
+   348→   348→            }
+   349→   349→          }
+   350→   350→        }
+   351→   351→        // Door reveal.
+   352→   352→        const dd = Math.hypot(map.door.midX - p.ox, map.door.midY - p.oy)
+   353→   353→        if (dd <= p.r && dd > rPrev - 0.5) {
+   354→   354→          this.doorRevealT = this.time
+   355→   355→          if (p.owner === 0 && !p.doorHit && this.phase === 'playing') {
+   356→   356→            p.doorHit = true
+   357→   357→            this.audio.doorTone(this.panOf(map.door.midX), this.volByDist(dd, 640) * 0.5 + 0.05)
+   358→   358→          }
+   359→   359→        }
+   360→   360→        // Key reveals.
+   361→   361→        for (const k of this.keys) {
+   362→   362→          if (k.found) continue
+   363→   363→          const kd = Math.hypot(k.x - p.ox, k.y - p.oy)
+   364→   364→          if (kd <= p.r && kd > rPrev - 0.5) {
+   365→   365→            k.revealT = this.time
+   366→   366→            if (p.owner === 0 && this.phase === 'playing') {
+   367→   367→              this.audio.jingle(this.panOf(k.x), 0.16)
+   368→   368→            }
+   369→   369→          }
+   370→   370→        }
+   371→   371→        // Monster / survivor-ghost reveal (only survivor pings screech).
+   372→   372→        const m = this.monster
+   373→   373→        if (m && p.owner === 0) {
+   374→   374→          const md = Math.hypot(m.x - p.ox, m.y - p.oy)
+   375→   375→          if (md <= p.r && md > rPrev - 0.5) {
+   376→   376→            m.revealT = this.time
+   377→   377→            if (this.phase === 'playing' && this.mode !== 'hunter' && this.screechGate <= 0) {
+   378→   378→              this.audio.screech(this.panOf(m.x), clamp(0.6 - md / 1400, 0.22, 0.6))
+   379→   379→              this.screechGate = 1.5
+   380→   380→              if (this.mode === 'solo' && m.state !== 'chase' && this.time > GRACE) {
+   381→   381→                m.pendingAt = this.time + 0.3
+   382→   382→                m.pendingX = this.player.x
+   383→   383→                m.pendingY = this.player.y
+   384→   384→              }
+   385→   385→            }
+   386→   386→          }
+   387→   387→        }
+   388→   388→      }
+   389→   389→      if (p.r >= p.maxR) p.dead = true
+   390→   390→    }
+   391→   391→    this.pings = this.pings.filter((p) => !p.dead)
+   392→   392→  }
+   393→   393→
+   394→   394→  private updatePlayer(dt: number): void {
+   395→   395→    let { x, y } = this.input
+   396→   396→    const l = Math.hypot(x, y)
+   397→   397→    if (l > 1) {
+   398→   398→      x /= l
+   399→   399→      y /= l
+   400→   400→    }
+   401→   401→    const moving = l > 0.08
+   402→   402→    const sp = PLAYER_SPEED
+   403→   403→    const nx = this.player.x + x * sp * dt
+   404→   404→    if (!this.hitsWall(nx, this.player.y)) this.player.x = nx
+   405→   405→    const ny = this.player.y + y * sp * dt
+   406→   406→    if (!this.hitsWall(this.player.x, ny)) this.player.y = ny
+   407→   407→
+   408→   408→    if (moving) {
+   409→   409→      this.stepT -= dt
+   410→   410→      if (this.stepT <= 0) {
+   411→   411→        this.stepT = this.mode === 'hunter' ? 0.3 : 0.34
+   412→   412→        if (this.mode === 'hunter') this.audio.monsterStep(0, 0.05)
+   413→   413→        else this.audio.step(0.045)
+   414→   414→      }
+   415→   415→    }
+   416→   416→  }
+   417→   417→
+   418→   418→  private updateKeys(dt: number): void {
+   419→   419→    for (const k of this.keys) {
+   420→   420→      if (k.found) continue
+   421→   421→      const d = Math.hypot(this.player.x - k.x, this.player.y - k.y)
+   422→   422→      // Faint jingle hints when a key is close by.
+   423→   423→      k.jT -= dt
+   424→   424→      if (d < 300 && k.jT <= 0) {
+   425→   425→        k.jT = 3.1 + Math.random() * 1.6
+   426→   426→        this.audio.jingle(this.panOf(k.x), 0.05 + 0.1 * this.volByDist(d, 300))
+   427→   427→      }
+   428→   428→      if (d < 24) {
+   429→   429→        k.found = true
+   430→   430→        this.keysFound++
+   431→   431→        this.audio.chime(this.panOf(k.x), 0.5)
+   432→   432→        this.hooks.onKeys?.(this.keysFound)
+   433→   433→        if (this.keysFound >= 3) {
+   434→   434→          this.unlocked = true
+   435→   435→          this.audio.unlock()
+   436→   436→          this.hooks.onToast?.('THE DOOR IS OPEN')
+   437→   437→          const m = this.monster
+   438→   438→          if (m && m.state === 'dormant') m.state = 'wander'
+   439→   439→        }
+   440→   440→      }
+   441→   441→    }
+   442→   442→  }
+   443→   443→
+   444→   444→  private updateExit(dt: number): void {
+   445→   445→    const map = this.map
+   446→   446→    if (!map) return
+   447→   447→    const d = Math.hypot(this.player.x - map.door.midX, this.player.y - map.door.midY)
+   448→   448→    if (this.unlocked) {
+   449→   449→      this.audio.setExitHum(this.volByDist(d, 280))
+   450→   450→      this.beaconT -= dt
+   451→   451→      if (this.beaconT <= 0) {
+   452→   452→        this.beaconT = 2.4
+   453→   453→        this.pings.push(this.makePing(map.door.midX, map.door.midY, 1, 170, 320))
+   454→   454→        if (d < 620) this.audio.doorBlip(this.panOf(map.door.midX), 0.05 + 0.14 * this.volByDist(d, 620))
+   455→   455→      }
+   456→   456→      if (d < 42) {
+   457→   457→        this.winAt = this.time
+   458→   458→        this.phase = 'win'
+   459→   459→        this.audio.setDanger(0)
+   460→   460→        this.audio.setExitHum(0)
+   461→   461→        this.audio.win()
+   462→   462→        this.hooks.onEnd?.({
+   463→   463→          outcome: 'escaped',
+   464→   464→          timeMs: Math.round(this.time * 1000),
+   465→   465→          keysFound: this.keysFound,
+   466→   466→          pings: this.pingsUsed,
+   467→   467→        })
+   468→   468→      }
+   469→   469→    } else {
+   470→   470→      this.audio.setExitHum(0)
+   471→   471→    }
+   472→   472→  }
+   473→   473→
+   474→   474→  private updateDanger(dt: number): void {
+   475→   475→    const m = this.monster
+   476→   476→    if (!m) return
+   477→   477→    if (this.time > GRACE) {
+   478→   478→      if (!this.graceAnnounced) {
+   479→   479→        this.graceAnnounced = true
+   480→   480→        this.hooks.onToast?.(
+   481→   481→          this.mode === 'solo'
+   482→   482→            ? 'SOMETHING IS AWAKE'
+   483→   483→            : this.mode === 'hunter'
+   484→   484→              ? 'THE PREY IS SOMEWHERE — IT PINGS'
+   485→   485→              : 'IT IS SOMEWHERE — LISTENING',
+   486→   486→        )
+   487→   487→        this.audio.growl(this.panOf(m.x), 0.5)
+   488→   488→      }
+   489→   489→      const d = Math.hypot(this.player.x - m.x, this.player.y - m.y)
+   490→   490→      let target = clamp(1 - d / 340, 0, 1)
+   491→   491→      if (m.state !== 'chase') target *= 0.6
+   492→   492→      this.danger += (target - this.danger) * Math.min(1, dt * 4)
+   493→   493→      if (this.danger > 0.04) {
+   494→   494→        this.hbT -= dt
+   495→   495→        if (this.hbT <= 0) {
+   496→   496→          this.hbT = 1.15 - 0.68 * this.danger
+   497→   497→          this.audio.heartbeat(0.1 + 0.45 * this.danger)
+   498→   498→        }
+   499→   499→      }
+   500→   500→      if (m.state === 'chase') this.shake = Math.max(this.shake, this.danger * 0.55)
+   501→   501→    }
+   502→   502→    this.audio.setDanger(this.danger)
+   503→   503→  }
+   504→   504→
+   505→   505→  // -------------------------------------------------------------- monster
+   506→   506→
+   507→   507→  private updateMonster(dt: number): void {
+   508→   508→    const map = this.map
+   509→   509→    const m = this.monster
+   510→   510→    if (!map || !m) return
+   511→   511→    if (m.state === 'dormant') {
+   512→   512→      if (this.time > GRACE) m.state = 'wander'
+   513→   513→      return
+   514→   514→    }
+   515→   515→
+   516→   516→    const d = Math.hypot(this.player.x - m.x, this.player.y - m.y)
+   517→   517→    const mc = worldToCell(map, m.x, m.y)
+   518→   518→
+   519→   519→    // Sense the player up close — no ping needed.
+   520→   520→    if (d < SENSE_R && m.state !== 'chase') {
+   521→   521→      m.state = 'chase'
+   522→   522→      m.path = []
+   523→   523→      m.repath = 0
+   524→   524→      m.lost = 0
+   525→   525→      if (this.screechGate <= 0) {
+   526→   526→        this.audio.screech(this.panOf(m.x), 0.65)
+   527→   527→        this.screechGate = 1.2
+   528→   528→      }
+   529→   529→      if (!this.chaseAnnounced) {
+   530→   530→        this.chaseAnnounced = true
+   531→   531→        this.hooks.onToast?.('RUN')
+   532→   532→      }
+   533→   533→    }
+   534→   534→
+   535→   535→    // A ping it heard (delayed reaction).
+   536→   536→    if (m.pendingAt > 0 && this.time >= m.pendingAt) {
+   537→   537→      m.pendingAt = 0
+   538→   538→      if (m.state !== 'chase') {
+   539→   539→        const cell = nearestOpenCell(map, ...this.cellOfPoint(m.pendingX, m.pendingY))
+   540→   540→        m.state = 'investigate'
+   541→   541→        m.target = cell
+   542→   542→        m.path = bfsPath(map, mc.c, mc.r, cell.c, cell.r)
+   543→   543→        m.pathI = 0
+   544→   544→      }
+   545→   545→    }
+   546→   546→
+   547→   547→    let speed = 60
+   548→   548→    if (m.state === 'chase') {
+   549→   549→      speed = 148 + this.keysFound * 8
+   550→   550→      m.lastPX = this.player.x
+   551→   551→      m.lastPY = this.player.y
+   552→   552→      if (d > LOSE_R) {
+   553→   553→        m.lost += dt
+   554→   554→        if (m.lost > 2.2) {
+   555→   555→          m.state = 'investigate'
+   556→   556→          m.target = nearestOpenCell(map, ...this.cellOfPoint(m.lastPX, m.lastPY))
+   557→   557→          m.path = bfsPath(map, mc.c, mc.r, m.target.c, m.target.r)
+   558→   558→          m.pathI = 0
+   559→   559→        }
+   560→   560→      } else {
+   561→   561→        m.lost = 0
+   562→   562→      }
+   563→   563→      m.repath -= dt
+   564→   564→      const pc = worldToCell(map, this.player.x, this.player.y)
+   565→   565→      if (m.repath <= 0) {
+   566→   566→        m.repath = 0.32
+   567→   567→        m.path = bfsPath(map, mc.c, mc.r, pc.c, pc.r)
+   568→   568→        m.pathI = 0
+   569→   569→      }
+   570→   570→      m.clickT -= dt
+   571→   571→      if (m.clickT <= 0) {
+   572→   572→        m.clickT = 2.6
+   573→   573→        this.monsterClick(m)
+   574→   574→      }
+   575→   575→      m.stepT -= dt
+   576→   576→      if (m.stepT <= 0 && d < 460) {
+   577→   577→        m.stepT = 0.27
+   578→   578→        this.audio.monsterStep(this.panOf(m.x), 0.1 + 0.3 * this.volByDist(d, 460))
+   579→   579→      }
+   580→   580→    } else if (m.state === 'investigate') {
+   581→   581→      speed = 98
+   582→   582→      if (!m.target || m.pathI >= m.path.length) {
+   583→   583→        m.state = 'wander'
+   584→   584→        m.target = null
+   585→   585→        m.path = []
+   586→   586→      }
+   587→   587→      m.clickT -= dt
+   588→   588→      if (m.clickT <= 0) {
+   589→   589→        m.clickT = 4.5 + Math.random() * 2.5
+   590→   590→        this.monsterClick(m)
+   591→   591→      }
+   592→   592→    } else {
+   593→   593→      // wander — it drifts through the dark, but its instinct pulls it
+   594→   594→      // toward your region of the maze (biased random walk).
+   595→   595→      speed = 60
+   596→   596→      if (m.pathI >= m.path.length) {
+   597→   597→        const cands: Cell[] = []
+   598→   598→        for (let i = 0; i < 8; i++) {
+   599→   599→          const c = clamp(mc.c + Math.floor((Math.random() - 0.5) * 22), 1, map.cols - 2)
+   600→   600→          const r = clamp(mc.r + Math.floor((Math.random() - 0.5) * 16), 1, map.rows - 2)
+   601→   601→          const cell = nearestOpenCell(map, c, r)
+   602→   602→          if (Math.hypot(cell.c - mc.c, cell.r - mc.r) >= 3) cands.push(cell)
+   603→   603→        }
+   604→   604→        if (cands.length > 0) {
+   605→   605→          let pick = cands[Math.floor(Math.random() * cands.length)]
+   606→   606→          if (Math.random() < 0.6) {
+   607→   607→            const pc = worldToCell(map, this.player.x, this.player.y)
+   608→   608→            for (const c of cands) {
+   609→   609→              if (
+   610→   610→                Math.hypot(c.c - pc.c, c.r - pc.r) <
+   611→   611→                Math.hypot(pick.c - pc.c, pick.r - pc.r)
+   612→   612→              ) {
+   613→   613→                pick = c
+   614→   614→              }
+   615→   615→            }
+   616→   616→          }
+   617→   617→          m.path = bfsPath(map, mc.c, mc.r, pick.c, pick.r)
+   618→   618→          m.pathI = 0
+   619→   619→        }
+   620→   620→      }
+   621→   621→      m.growlT -= dt
+   622→   622→      if (m.growlT <= 0) {
+   623→   623→        m.growlT = 3.5 + Math.random() * 4.5
+   624→   624→        this.audio.growl(this.panOf(m.x), 0.06 + 0.4 * this.volByDist(d, 560))
+   625→   625→      }
+   626→   626→      m.clickT -= dt
+   627→   627→      if (m.clickT <= 0) {
+   628→   628→        m.clickT = 6 + Math.random() * 3
+   629→   629→        this.monsterClick(m)
+   630→   630→      }
+   631→   631→    }
+   632→   632→
+   633→   633→    // Follow path.
+   634→   634→    if (m.pathI < m.path.length) {
+   635→   635→      const wp = m.path[m.pathI]
+   636→   636→      const dx = wp.x - m.x
+   637→   637→      const dy = wp.y - m.y
+   638→   638→      const dl = Math.hypot(dx, dy)
+   639→   639→      if (dl < 6) {
+   640→   640→        m.pathI++
+   641→   641→      } else {
+   642→   642→        m.x += (dx / dl) * speed * dt
+   643→   643→        m.y += (dy / dl) * speed * dt
+   644→   644→      }
+   645→   645→    }
+   646→   646→
+   647→   647→    // Catch.
+   648→   648→    this.checkCatch(d)
+   649→   649→  }
+   650→   650→
+   651→   651→  private checkCatch(d: number): void {
+   652→   652→    if (d >= CATCH_R || this.phase !== 'playing') return
+   653→   653→    const m = this.monster
+   654→   654→    this.deathAt = this.time
+   655→   655→    this.phase = 'dead'
+   656→   656→    this.shake = 1.4
+   657→   657→    this.audio.setDanger(0)
+   658→   658→    this.audio.setExitHum(0)
+   659→   659→    this.audio.death()
+   660→   660→    if (m) m.revealT = this.time
+   661→   661→    this.hooks.onEnd?.({
+   662→   662→      outcome: 'caught',
+   663→   663→      timeMs: Math.round(this.time * 1000),
+   664→   664→      keysFound: this.keysFound,
+   665→   665→      pings: this.pingsUsed,
+   666→   666→    })
+   667→   667→  }
+   668→   668→
+   669→   669→  // ------------------------------------------------------------ multiplayer
+   670→   670→
+   671→   671→  /** Host side: ease the monster toward the hunter's reported position. */
+   672→   672→  private updateRemoteMonster(dt: number): void {
+   673→   673→    const m = this.monster
+   674→   674→    if (!m) return
+   675→   675→    const k = Math.min(1, dt * 14)
+   676→   676→    m.x += (m.netX - m.x) * k
+   677→   677→    m.y += (m.netY - m.y) * k
+   678→   678→    if (m.netMoving) {
+   679→   679→      m.stepT -= dt
+   680→   680→      if (m.stepT <= 0) {
+   681→   681→        m.stepT = 0.3
+   682→   682→        const d = Math.hypot(this.player.x - m.x, this.player.y - m.y)
+   683→   683→        if (d < 560) this.audio.monsterStep(this.panOf(m.x), 0.06 + 0.3 * this.volByDist(d, 560))
+   684→   684→      }
+   685→   685→    }
+   686→   686→    this.checkCatch(Math.hypot(this.player.x - m.x, this.player.y - m.y))
+   687→   687→  }
+   688→   688→
+   689→   689→  /** Hunter side: the survivor ghost eases toward reported positions. */
+   690→   690→  private updateGhost(dt: number): void {
+   691→   691→    const m = this.monster
+   692→   692→    if (!m) return
+   693→   693→    const k = Math.min(1, dt * 14)
+   694→   694→    m.x += (m.netX - m.x) * k
+   695→   695→    m.y += (m.netY - m.y) * k
+   696→   696→    if (m.netMoving) {
+   697→   697→      m.stepT -= dt
+   698→   698→      if (m.stepT <= 0) {
+   699→   699→        m.stepT = 0.34
+   700→   700→        const d = Math.hypot(this.player.x - m.x, this.player.y - m.y)
+   701→   701→        if (d < 700) this.audio.step(0.03 + 0.3 * this.volByDist(d, 700), this.panOf(m.x))
+   702→   702→      }
+   703→   703→    }
+   704→   704→  }
+   705→   705→
+   706→   706→  setRemoteMonster(x: number, y: number, moving: boolean): void {
+   707→   707→    const m = this.monster
+   708→   708→    if (!m) return
+   709→   709→    m.netX = x
+   710→   710→    m.netY = y
+   711→   711→    m.netMoving = moving
+   712→   712→  }
+   713→   713→
+   714→   714→  setRemoteSurvivor(x: number, y: number, moving: boolean): void {
+   715→   715→    this.setRemoteMonster(x, y, moving)
+   716→   716→  }
+   717→   717→
+   718→   718→  /** Host side: the hunter's echolocation click, arriving over the wire. */
+   719→   719→  netMonsterClick(x: number, y: number): void {
+   720→   720→    if (this.phase !== 'playing' || !this.map) return
+   721→   721→    const d = Math.hypot(this.player.x - x, this.player.y - y)
+   722→   722→    this.audio.monsterClick(this.panOf(x), 0.05 + 0.3 * this.volByDist(d, 700))
+   723→   723→    this.pings.push(this.makePing(x, y, 1, 430, 440))
+   724→   724→  }
+   725→   725→
+   726→   726→  /** Hunter side: the survivor's sonar ping, arriving over the wire. */
+   727→   727→  netSurvivorPing(x: number, y: number): void {
+   728→   728→    if (this.phase !== 'playing' || !this.map) return
+   729→   729→    const d = Math.hypot(this.player.x - x, this.player.y - y)
+   730→   730→    this.audio.pingHeard(this.panOf(x), 0.3 + 0.7 * this.volByDist(d, 900))
+   731→   731→    this.pings.push(this.makePing(x, y, 0, PING_MAX_R, PING_SPEED))
+   732→   732→  }
+   733→   733→
+   734→   734→  get playerPos(): { x: number; y: number } {
+   735→   735→    return { x: this.player.x, y: this.player.y }
+   736→   736→  }
+   737→   737→
+   738→   738→  get otherPos(): { x: number; y: number } {
+   739→   739→    const m = this.monster
+   740→   740→    return m ? { x: m.x, y: m.y } : { x: -9999, y: -9999 }
+   741→   741→  }
+   742→   742→
+   743→   743→  private cellOfPoint(x: number, y: number): [number, number] {
+   744→   744→    const map = this.map
+   745→   745→    if (!map) return [1, 1]
+   746→   746→    const c = worldToCell(map, x, y)
+   747→   747→    return [c.c, c.r]
+   748→   748→  }
+   749→   749→
+   750→   750→  /** The monster emits its own echolocation — you see the world flash through ITS senses. */
+   751→   751→  private monsterClick(m: Monster): void {
+   752→   752→    const d = Math.hypot(this.player.x - m.x, this.player.y - m.y)
+   753→   753→    this.audio.monsterClick(this.panOf(m.x), 0.05 + 0.3 * this.volByDist(d, 700))
+   754→   754→    this.pings.push(this.makePing(m.x, m.y, 1, 430, 440))
+   755→   755→  }
+   756→   756→
+   757→   757→  // ---------------------------------------------------------------- render
+   758→   758→
+   759→   759→  render(ctx: CanvasRenderingContext2D, cw: number, ch: number, dpr: number): void {
+   760→   760→    ctx.setTransform(dpr, 0, 0, dpr, 0, 0)
+   761→   761→    ctx.fillStyle = '#000000'
+   762→   762→    ctx.fillRect(0, 0, cw, ch)
+   763→   763→    const map = this.map
+   764→   764→    if (!map) return
+   765→   765→    const t = this.time
+   766→   766→
+   767→   767→    const zoom = clamp(Math.min(cw, ch) / 660, 0.9, 1.5)
+   768→   768→    const sh = this.shake
+   769→   769→    const sx = (Math.random() - 0.5) * 12 * sh
+   770→   770→    const sy = (Math.random() - 0.5) * 12 * sh
+   771→   771→
+   772→   772→    ctx.save()
+   773→   773→    ctx.translate(cw / 2 + sx, ch / 2 + sy)
+   774→   774→    ctx.scale(zoom, zoom)
+   775→   775→    ctx.translate(-this.cam.x, -this.cam.y)
+   776→   776→    ctx.lineCap = 'round'
+   777→   777→    ctx.lineJoin = 'round'
+   778→   778→
+   779→   779→    // --- Revealed wall wireframes ---
+   780→   780→    for (let i = 0; i < map.edges.length; i++) {
+   781→   781→      const age = t - this.revealT[i]
+   782→   782→      if (age > 3 || age < 0) continue
+   783→   783→      const a = this.revealS[i] * expFade(age, 0.55)
+   784→   784→      if (a < 0.015) continue
+   785→   785→      const e = map.edges[i]
+   786→   786→      ctx.strokeStyle = `rgba(255,255,255,${(a * 0.22).toFixed(3)})`
+   787→   787→      ctx.lineWidth = 5
+   788→   788→      ctx.beginPath()
+   789→   789→      ctx.moveTo(e.x1, e.y1)
+   790→   790→      ctx.lineTo(e.x2, e.y2)
+   791→   791→      ctx.stroke()
+   792→   792→      ctx.strokeStyle = `rgba(255,255,255,${a.toFixed(3)})`
+   793→   793→      ctx.lineWidth = 1.8
+   794→   794→      ctx.beginPath()
+   795→   795→      ctx.moveTo(e.x1, e.y1)
+   796→   796→      ctx.lineTo(e.x2, e.y2)
+   797→   797→      ctx.stroke()
+   798→   798→    }
+   799→   799→
+   800→   800→    // --- Exit door ---
+   801→   801→    const dAge = t - this.doorRevealT
+   802→   802→    const dA = dAge >= 0 ? expFade(dAge, 0.6) : 0
+   803→   803→    if (dA > 0.02) {
+   804→   804→      const door = map.door
+   805→   805→      const depth = 16
+   806→   806→      const half = map.cell / 2 - 6
+   807→   807→      ctx.save()
+   808→   808→      ctx.translate(door.midX, door.midY)
+   809→   809→      if (door.vertical) {
+   810→   810→        const dir = door.midX < map.w / 2 ? 1 : -1
+   811→   811→        const pulse = this.unlocked ? 0.65 + 0.35 * Math.sin(t * 5) : 1
+   812→   812→        const a = dA * pulse
+   813→   813→        ctx.strokeStyle = `rgba(255,255,255,${(a * 0.9).toFixed(3)})`
+   814→   814→        ctx.lineWidth = 2
+   815→   815→        ctx.strokeRect(dir > 0 ? -depth : 0, -half, depth, half * 2)
+   816→   816→        if (!this.unlocked) {
+   817→   817→          // Sealed: cross bars.
+   818→   818→          ctx.beginPath()
+   819→   819→          ctx.moveTo(dir > 0 ? -depth : 0, -half)
+   820→   820→          ctx.lineTo(dir > 0 ? 0 : depth, half)
+   821→   821→          ctx.moveTo(dir > 0 ? -depth : 0, half)
+   822→   822→          ctx.lineTo(dir > 0 ? 0 : depth, -half)
+   823→   823→          ctx.stroke()
+   824→   824→        } else {
+   825→   825→          ctx.strokeStyle = `rgba(255,255,255,${(a * 0.5).toFixed(3)})`
+   826→   826→          ctx.strokeRect(dir > 0 ? -depth + 4 : 4, -half + 5, depth - 8, half * 2 - 10)
+   827→   827→        }
+   828→   828→      } else {
+   829→   829→        const dir = door.midY < map.h / 2 ? 1 : -1
+   830→   830→        const pulse = this.unlocked ? 0.65 + 0.35 * Math.sin(t * 5) : 1
+   831→   831→        const a = dA * pulse
+   832→   832→        ctx.strokeStyle = `rgba(255,255,255,${(a * 0.9).toFixed(3)})`
+   833→   833→        ctx.lineWidth = 2
+   834→   834→        ctx.strokeRect(-half, dir > 0 ? -depth : 0, half * 2, depth)
+   835→   835→        if (!this.unlocked) {
+   836→   836→          ctx.beginPath()
+   837→   837→          ctx.moveTo(-half, dir > 0 ? -depth : 0)
+   838→   838→          ctx.lineTo(half, dir > 0 ? 0 : depth)
+   839→   839→          ctx.moveTo(-half, dir > 0 ? 0 : depth)
+   840→   840→          ctx.lineTo(half, dir > 0 ? -depth : 0)
+   841→   841→          ctx.stroke()
+   842→   842→        } else {
+   843→   843→          ctx.strokeStyle = `rgba(255,255,255,${(a * 0.5).toFixed(3)})`
+   844→   844→          ctx.strokeRect(-half + 5, dir > 0 ? -depth + 4 : 4, half * 2 - 10, depth - 8)
+   845→   845→        }
+   846→   846→      }
+   847→   847→      ctx.restore()
+   848→   848→    }
+   849→   849→
+   850→   850→    // --- Keys ---
+   851→   851→    for (const k of this.keys) {
+   852→   852→      if (k.found) continue
+   853→   853→      const age = t - k.revealT
+   854→   854→      if (age < 0 || age > 2.4) continue
+   855→   855→      const a = expFade(age, 0.6)
+   856→   856→      if (a < 0.02) continue
+   857→   857→      const rot = t * 1.2 + k.x * 0.01
+   858→   858→      ctx.save()
+   859→   859→      ctx.translate(k.x, k.y)
+   860→   860→      ctx.rotate(rot)
+   861→   861→      ctx.strokeStyle = `rgba(255,255,255,${(a * 0.95).toFixed(3)})`
+   862→   862→      ctx.lineWidth = 1.8
+   863→   863→      ctx.beginPath()
+   864→   864→      ctx.moveTo(0, -10)
+   865→   865→      ctx.lineTo(7, 0)
+   866→   866→      ctx.lineTo(0, 10)
+   867→   867→      ctx.lineTo(-7, 0)
+   868→   868→      ctx.closePath()
+   869→   869→      ctx.stroke()
+   870→   870→      ctx.beginPath()
+   871→   871→      ctx.moveTo(0, -3.5)
+   872→   872→      ctx.lineTo(2.6, 0)
+   873→   873→      ctx.lineTo(0, 3.5)
+   874→   874→      ctx.lineTo(-2.6, 0)
+   875→   875→      ctx.closePath()
+   876→   876→      ctx.stroke()
+   877→   877→      ctx.restore()
+   878→   878→    }
+   879→   879→
+   880→   880→    // --- Ping rings ---
+   881→   881→    for (const p of this.pings) {
+   882→   882→      const base = 1 - p.r / p.maxR
+   883→   883→      if (p.owner === 0) {
+   884→   884→        const a = base * 0.9
+   885→   885→        ctx.strokeStyle = `rgba(255,255,255,${a.toFixed(3)})`
+   886→   886→        ctx.lineWidth = 2
+   887→   887→        ctx.beginPath()
+   888→   888→        ctx.arc(p.ox, p.oy, p.r, 0, Math.PI * 2)
+   889→   889→        ctx.stroke()
+   890→   890→        const r2 = p.r - 18
+   891→   891→        if (r2 > 4) {
+   892→   892→          ctx.strokeStyle = `rgba(255,255,255,${(base * 0.22).toFixed(3)})`
+   893→   893→          ctx.lineWidth = 1
+   894→   894→          ctx.beginPath()
+   895→   895→          ctx.arc(p.ox, p.oy, r2, 0, Math.PI * 2)
+   896→   896→          ctx.stroke()
+   897→   897→        }
+   898→   898→        // Corruption: the ring bends around the monster.
+   899→   899→        const m = this.monster
+   900→   900→        if (m) {
+   901→   901→          const md = Math.hypot(m.x - p.ox, m.y - p.oy)
+   902→   902→          if (Math.abs(md - p.r) < 50 && md > 30) {
+   903→   903→            const ang = Math.atan2(m.y - p.oy, m.x - p.ox)
+   904→   904→            ctx.strokeStyle = `rgba(255,255,255,${(base * 1.1).toFixed(3)})`
+   905→   905→            ctx.lineWidth = 2
+   906→   906→            ctx.beginPath()
+   907→   907→            const segs = 12
+   908→   908→            const width = 0.38
+   909→   909→            for (let i = 0; i <= segs; i++) {
+   910→   910→              const th = ang - width / 2 + (width * i) / segs
+   911→   911→              const jr = p.r + p.jag[i % p.jag.length] * 9
+   912→   912→              const px = p.ox + Math.cos(th) * jr
+   913→   913→              const py = p.oy + Math.sin(th) * jr
+   914→   914→              if (i === 0) ctx.moveTo(px, py)
+   915→   915→              else ctx.lineTo(px, py)
+   916→   916→            }
+   917→   917→            ctx.stroke()
+   918→   918→          }
+   919→   919→        }
+   920→   920→      } else {
+   921→   921→        // Monster/door ping: jagged, dim, wrong.
+   922→   922→        const a = base * 0.32
+   923→   923→        ctx.strokeStyle = `rgba(255,255,255,${a.toFixed(3)})`
+   924→   924→        ctx.lineWidth = 1.2
+   925→   925→        ctx.beginPath()
+   926→   926→        const segs = 44
+   927→   927→        for (let i = 0; i <= segs; i++) {
+   928→   928→          const th = (i / segs) * Math.PI * 2
+   929→   929→          const jr = p.r + p.jag[i % p.jag.length] * 4
+   930→   930→          const px = p.ox + Math.cos(th) * jr
+   931→   931→          const py = p.oy + Math.sin(th) * jr
+   932→   932→          if (i === 0) ctx.moveTo(px, py)
+   933→   933→          else ctx.lineTo(px, py)
+   934→   934→        }
+   935→   935→        ctx.closePath()
+   936→   936→        ctx.stroke()
+   937→   937→      }
+   938→   938→    }
+   939→   939→
+   940→   940→    // --- Monster body (revealed by a survivor ping) / survivor ghost (hunter) ---
+   941→   941→    const m = this.monster
+   942→   942→    if (m) {
+   943→   943→      const mage = t - m.revealT
+   944→   944→      if (mage >= 0 && mage < 0.5 && this.mode !== 'hunter') {
+   945→   945→        const a = (1 - mage / 0.5) * 0.95
+   946→   946→        const s = Math.floor(t * 12)
+   947→   947→        ctx.strokeStyle = `rgba(255,255,255,${a.toFixed(3)})`
+   948→   948→        ctx.lineWidth = 2
+   949→   949→        ctx.beginPath()
+   950→   950→        const pts = 16
+   951→   951→        for (let i = 0; i <= pts; i++) {
+   952→   952→          const th = (i / pts) * Math.PI * 2
+   953→   953→          const n = Math.sin(s * 3.7 + i * 2.4) * 0.5 + Math.sin(s * 9.1 + i * 5.3) * 0.5
+   954→   954→          const rr = 13 + n * 10
+   955→   955→          const px = m.x + Math.cos(th) * rr
+   956→   956→          const py = m.y + Math.sin(th) * rr
+   957→   957→          if (i === 0) ctx.moveTo(px, py)
+   958→   958→          else ctx.lineTo(px, py)
+   959→   959→        }
+   960→   960→        ctx.closePath()
+   961→   961→        ctx.stroke()
+   962→   962→      } else if (mage >= 0 && mage < 0.7 && this.mode === 'hunter') {
+   963→   963→        // The survivor, caught in the light of their own ping.
+   964→   964→        const a = (1 - mage / 0.7) * 0.95
+   965→   965→        ctx.strokeStyle = `rgba(255,255,255,${a.toFixed(3)})`
+   966→   966→        ctx.lineWidth = 2
+   967→   967→        ctx.beginPath()
+   968→   968→        ctx.arc(m.x, m.y, PLAYER_R, 0, Math.PI * 2)
+   969→   969→        ctx.stroke()
+   970→   970→        ctx.fillStyle = `rgba(255,255,255,${a.toFixed(3)})`
+   971→   971→        ctx.beginPath()
+   972→   972→        ctx.arc(m.x, m.y, 2.4, 0, Math.PI * 2)
+   973→   973→        ctx.fill()
+   974→   974→      }
+   975→   975→    }
+   976→   976→
+   977→   977→    // --- Danger static ---
+   978→   978→    if (this.danger > 0.05 && this.phase === 'playing') {
+   979→   979→      const n = Math.floor(this.danger * 18)
+   980→   980→      for (let i = 0; i < n; i++) {
+   981→   981→        const a = (0.03 + Math.random() * 0.09) * this.danger
+   982→   982→        ctx.fillStyle = `rgba(255,255,255,${a.toFixed(3)})`
+   983→   983→        const px = this.player.x + (Math.random() - 0.5) * 520
+   984→   984→        const py = this.player.y + (Math.random() - 0.5) * 520
+   985→   985→        ctx.fillRect(px, py, 1.6, 1.6)
+   986→   986→      }
+   987→   987→    }
+   988→   988→
+   989→   989→    // --- Local body: survivor ring, or the hunter's own jagged shape ---
+   990→   990→    const px = this.player.x
+   991→   991→    const py = this.player.y
+   992→   992→    if (this.mode === 'hunter') {
+   993→   993→      const s = Math.floor(t * 12)
+   994→   994→      ctx.strokeStyle = 'rgba(255,255,255,0.72)'
+   995→   995→      ctx.lineWidth = 1.8
+   996→   996→      ctx.beginPath()
+   997→   997→      const pts = 16
+   998→   998→      for (let i = 0; i <= pts; i++) {
+   999→   999→        const th = (i / pts) * Math.PI * 2
+  1000→  1000→        const n = Math.sin(s * 3.7 + i * 2.4) * 0.5 + Math.sin(s * 9.1 + i * 5.3) * 0.5
+  1001→  1001→        const rr = 11 + n * 5
+  1002→  1002→        const qx = px + Math.cos(th) * rr
+  1003→  1003→        const qy = py + Math.sin(th) * rr
+  1004→  1004→        if (i === 0) ctx.moveTo(qx, qy)
+  1005→  1005→        else ctx.lineTo(qx, qy)
+  1006→  1006→      }
+  1007→  1007→      ctx.closePath()
+  1008→  1008→      ctx.stroke()
+  1009→  1009→    } else {
+  1010→  1010→      ctx.strokeStyle = 'rgba(255,255,255,0.95)'
+  1011→  1011→      ctx.lineWidth = 2
+  1012→  1012→      ctx.beginPath()
+  1013→  1013→      ctx.arc(px, py, PLAYER_R, 0, Math.PI * 2)
+  1014→  1014→      ctx.stroke()
+  1015→  1015→      ctx.fillStyle = 'rgba(255,255,255,0.95)'
+  1016→  1016→      ctx.beginPath()
+  1017→  1017→      ctx.arc(px, py, 2.4, 0, Math.PI * 2)
+  1018→  1018→      ctx.fill()
+  1019→  1019→    }
+  1020→  1020→    // Ping cooldown ring.
+  1021→  1021→    if (this.cooldown > 0) {
+  1022→  1022→      const frac = 1 - this.cooldown / PING_COOLDOWN
+  1023→  1023→      ctx.strokeStyle = 'rgba(255,255,255,0.3)'
+  1024→  1024→      ctx.lineWidth = 1.5
+  1025→  1025→      ctx.beginPath()
+  1026→  1026→      ctx.arc(px, py, 15, -Math.PI / 2, -Math.PI / 2 + frac * Math.PI * 2)
+  1027→  1027→      ctx.stroke()
+  1028→  1028→    } else {
+  1029→  1029→      ctx.strokeStyle = `rgba(255,255,255,${(0.26 + 0.12 * Math.sin(t * 5)).toFixed(3)})`
+  1030→  1030→      ctx.lineWidth = 1
+  1031→  1031→      ctx.beginPath()
+  1032→  1032→      ctx.arc(px, py, 15, 0, Math.PI * 2)
+  1033→  1033→      ctx.stroke()
+  1034→  1034→    }
+  1035→  1035→
+  1036→  1036→    ctx.restore()
+  1037→  1037→
+  1038→  1038→    // --- Death flash (screen space) ---
+  1039→  1039→    if (this.phase === 'dead' && t - this.deathAt < 0.07) {
+  1040→  1040→      ctx.fillStyle = 'rgba(255,255,255,0.85)'
+  1041→  1041→      ctx.fillRect(0, 0, cw, ch)
+  1042→  1042→    }
+  1043→  1043→  }
+  1044→  1044→
+  1045→  1045→  get elapsedMs(): number {
+  1046→  1046→    return Math.round(this.time * 1000)
+  1047→  1047→  }
+  1048→  1048→
+  1049→  1049→  get currentSeed(): number {
+  1050→  1050→    return this.seed
+  1051→  1051→  }
+  1052→  1052→}
+  1053→  1053→

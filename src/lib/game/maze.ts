@@ -11,10 +11,19 @@ export interface Edge {
   y2: number
 }
 
+export type DoorColor = 'white' | 'crimson' | 'jade'
+
 export interface DoorSpec {
   midX: number
   midY: number
   vertical: boolean
+  color: DoorColor
+}
+
+export interface KeySpec {
+  x: number
+  y: number
+  color: DoorColor
 }
 
 export interface Vec {
@@ -38,8 +47,9 @@ export interface GameMap {
   open: number[] // flat indices of reachable open cells
   start: Vec
   monsterStart: Vec
-  keys: Vec[]
-  door: DoorSpec
+  keys: KeySpec[]
+  /** Solo: one white door. Hunt: two colored doors on opposite ends. */
+  doors: DoorSpec[]
 }
 
 export const MAP_COLS = 31
@@ -231,7 +241,11 @@ function mergeSegs(raw: RawSeg[], vertical: boolean): Edge[] {
   return out
 }
 
-export function generateMap(seed: number): GameMap {
+/**
+ * @param seed deterministic map
+ * @param hunt two-player variant: two colored doors + six colored keys
+ */
+export function generateMap(seed: number, hunt = false): GameMap {
   const rng = mulberry32(seed)
   const cols = MAP_COLS
   const rows = MAP_ROWS
@@ -298,7 +312,7 @@ export function generateMap(seed: number): GameMap {
     start: { x: 0, y: 0 },
     monsterStart: { x: 0, y: 0 },
     keys: [],
-    door: { midX: 0, midY: 0, vertical: true },
+    doors: [],
   }
 
   // --- Reachability from start; wall off unreachable pockets ---
@@ -332,58 +346,149 @@ export function generateMap(seed: number): GameMap {
   // --- Player start ---
   map.start = cellCenter(map, 1, 1)
 
-  // --- Exit door: reachable open cell touching the border, farthest from start ---
+  // --- Border ring open cells (door candidates) ---
   const borderOpen: Cell[] = []
   for (const i of map.open) {
     const c = i % cols
     const r = Math.floor(i / cols)
     if (c === 1 || c === cols - 2 || r === 1 || r === rows - 2) borderOpen.push({ c, r })
   }
-  let bestDoor = borderOpen[0] ?? { c: cols - 2, r: rows - 2 }
-  let bestD = -1
-  for (const cellPos of borderOpen) {
-    const d = dist[idx(cellPos.c, cellPos.r)]
-    if (d > bestD) {
-      bestD = d
-      bestDoor = cellPos
-    }
-  }
-  const dc = bestDoor.c
-  const dr = bestDoor.r
-  if (dc === 1) map.door = { midX: cell, midY: dr * cell + cell / 2, vertical: true }
-  else if (dc === cols - 2)
-    map.door = { midX: (cols - 1) * cell, midY: dr * cell + cell / 2, vertical: true }
-  else if (dr === 1) map.door = { midX: dc * cell + cell / 2, midY: cell, vertical: false }
-  else map.door = { midX: dc * cell + cell / 2, midY: (rows - 1) * cell, vertical: false }
 
-  // --- Keys: spread out, far from start and from the door ---
-  const doorCell = worldToCell(map, map.door.midX, map.door.midY)
   const openCells: { c: number; r: number; d: number }[] = []
   for (const i of map.open) {
     const c = i % cols
     const r = Math.floor(i / cols)
     openCells.push({ c, r, d: dist[i] })
   }
-  const keys: Cell[] = []
-  let guard = 0
-  while (keys.length < 3 && guard++ < 4000) {
-    const cand = openCells[Math.floor(rng() * openCells.length)]
-    if (cand.d < 10) continue
-    if (Math.abs(cand.c - doorCell.c) + Math.abs(cand.r - doorCell.r) < 4) continue
-    let ok = true
-    for (const k of keys) {
-      if (Math.hypot(k.c - cand.c, k.r - cand.r) < 8) {
-        ok = false
-        break
+
+  /** Build a door spec on the outer wall next to a border open cell. */
+  const doorSpecFor = (cellPos: Cell, color: DoorColor): DoorSpec => {
+    const dc = cellPos.c
+    const dr = cellPos.r
+    if (dc === 1) return { midX: cell, midY: dr * cell + cell / 2, vertical: true, color }
+    if (dc === cols - 2)
+      return { midX: (cols - 1) * cell, midY: dr * cell + cell / 2, vertical: true, color }
+    if (dr === 1) return { midX: dc * cell + cell / 2, midY: cell, vertical: false, color }
+    return { midX: dc * cell + cell / 2, midY: (rows - 1) * cell, vertical: false, color }
+  }
+
+  if (!hunt) {
+    // --- Solo: one white exit door, farthest from start; three white keys ---
+    let bestDoor = borderOpen[0] ?? { c: cols - 2, r: rows - 2 }
+    let bestD = -1
+    for (const cellPos of borderOpen) {
+      const d = dist[idx(cellPos.c, cellPos.r)]
+      if (d > bestD) {
+        bestD = d
+        bestDoor = cellPos
       }
     }
-    if (ok) keys.push({ c: cand.c, r: cand.r })
+    map.doors = [doorSpecFor(bestDoor, 'white')]
+
+    const doorCell = worldToCell(map, map.doors[0].midX, map.doors[0].midY)
+    const keys: Cell[] = []
+    let guard = 0
+    while (keys.length < 3 && guard++ < 4000) {
+      const cand = openCells[Math.floor(rng() * openCells.length)]
+      if (cand.d < 10) continue
+      if (Math.abs(cand.c - doorCell.c) + Math.abs(cand.r - doorCell.r) < 4) continue
+      let ok = true
+      for (const k of keys) {
+        if (Math.hypot(k.c - cand.c, k.r - cand.r) < 8) {
+          ok = false
+          break
+        }
+      }
+      if (ok) keys.push({ c: cand.c, r: cand.r })
+    }
+    while (keys.length < 3) {
+      const cand = openCells[Math.floor(rng() * openCells.length)]
+      keys.push({ c: cand.c, r: cand.r })
+    }
+    map.keys = keys.map((k) => ({ ...cellCenter(map, k.c, k.r), color: 'white' as DoorColor }))
+  } else {
+    // --- Hunt: two far-apart colored doors; each door's three keys spawn on
+    //     the FAR side of the maze from that door, so the prey must cross. ---
+    let doorA = borderOpen[0] ?? { c: cols - 2, r: rows - 2 }
+    let bestA = -1
+    for (const cellPos of borderOpen) {
+      const d = dist[idx(cellPos.c, cellPos.r)]
+      if (d > bestA) {
+        bestA = d
+        doorA = cellPos
+      }
+    }
+    let doorB = borderOpen[0] ?? { c: 1, r: rows - 2 }
+    let bestB = -1
+    for (const cellPos of borderOpen) {
+      const d = Math.hypot(cellPos.c * cell - doorA.c * cell, cellPos.r * cell - doorA.r * cell)
+      if (d > bestB) {
+        bestB = d
+        doorB = cellPos
+      }
+    }
+    const flip = rng() < 0.5
+    const colorA: DoorColor = flip ? 'jade' : 'crimson'
+    const colorB: DoorColor = flip ? 'crimson' : 'jade'
+    map.doors = [doorSpecFor(doorA, colorA), doorSpecFor(doorB, colorB)]
+
+    // BFS distances from each door's adjacent open cell.
+    const cellA = worldToCell(map, map.doors[0].midX, map.doors[0].midY)
+    const cellB = worldToCell(map, map.doors[1].midX, map.doors[1].midY)
+    const nearA = nearestOpenCell(map, cellA.c, cellA.r)
+    const nearB = nearestOpenCell(map, cellB.c, cellB.r)
+    const dA = bfsDistances(map, nearA.c, nearA.r)
+    const dB = bfsDistances(map, nearB.c, nearB.r)
+
+    const keys: { c: number; r: number; color: DoorColor }[] = []
+    const colorTasks: [DoorColor, Int32Array, Int32Array][] = [
+      [colorA, dA, dB],
+      [colorB, dB, dA],
+    ]
+    for (const [color, own, other] of colorTasks) {
+      let placed = 0
+      let relax = 0 // progressively loosen constraints if the maze is tight
+      let guard = 0
+      while (placed < 3 && relax <= 3) {
+        guard++
+        if (guard > 6000) {
+          relax++
+          guard = 0
+          continue
+        }
+        const cand = openCells[Math.floor(rng() * openCells.length)]
+        const od = own[idx(cand.c, cand.r)]
+        const td = other[idx(cand.c, cand.r)]
+        if (od < 0 || td < 0) continue
+        // Keys of a color live closer to the OTHER door (cross the maze).
+        if (relax === 0 && od <= td) continue
+        if (relax === 1 && od < td) continue
+        if (cand.d < (relax >= 2 ? 4 : 7)) continue
+        let ok = true
+        for (const k of keys) {
+          const lim = relax >= 3 ? 3 : k.color === color ? 6 : 4
+          if (Math.hypot(k.c - cand.c, k.r - cand.r) < lim) {
+            ok = false
+            break
+          }
+        }
+        if (ok && relax < 3) {
+          if (Math.abs(cand.c - nearA.c) + Math.abs(cand.r - nearA.r) < 3) ok = false
+          if (Math.abs(cand.c - nearB.c) + Math.abs(cand.r - nearB.r) < 3) ok = false
+        }
+        if (ok) {
+          keys.push({ c: cand.c, r: cand.r, color })
+          placed++
+        }
+      }
+      while (placed < 3) {
+        const cand = openCells[Math.floor(rng() * openCells.length)]
+        keys.push({ c: cand.c, r: cand.r, color })
+        placed++
+      }
+    }
+    map.keys = keys.map((k) => ({ ...cellCenter(map, k.c, k.r), color: k.color }))
   }
-  while (keys.length < 3) {
-    const cand = openCells[Math.floor(rng() * openCells.length)]
-    keys.push({ c: cand.c, r: cand.r })
-  }
-  map.keys = keys.map((k) => cellCenter(map, k.c, k.r))
 
   // --- Monster spawn: farthest reachable cell from the player ---
   let mBest = openCells[0]

@@ -573,11 +573,11 @@ export class SoundEngine {
     o.stop(t + 0.33)
   }
 
-  /** All three keys collected — the door unlocks. */
-  unlock(): void {
+  /** All three keys collected — the door unlocks (pan points at the door). */
+  unlock(pan = 0): void {
     if (!this.ctx) return
     const t = this.ctx.currentTime
-    const p = this.out(0, 1, 0.6)
+    const p = this.out(pan, 1, 0.6)
     if (!p) return
     const src = this.noiseSource()
     if (src) {

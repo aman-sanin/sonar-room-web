@@ -7,7 +7,15 @@ import { useCallback, useEffect, useRef, useState, useSyncExternalStore } from '
 import { io, type Socket } from 'socket.io-client'
 import { SonarEngine, RunResult } from '@/lib/game/engine'
 import { SoundEngine } from '@/lib/game/audio'
-import type { Role, ReadyPayload, HuntEvt, CreateAck, JoinAck } from '@/lib/game/net'
+import type {
+  Role,
+  ReadyPayload,
+  HuntEvt,
+  CreateAck,
+  JoinAck,
+  KeyCounts,
+  HuntDoorColor,
+} from '@/lib/game/net'
 
 const ROOM_SERVICE_PORT = 3003
 
@@ -74,7 +82,10 @@ function SonarRoomGame() {
   const startTimerRef = useRef<number>(0)
 
   const [phase, setPhaseState] = useState<Phase>('menu')
-  const [keysFound, setKeysFound] = useState(0)
+  const [keyCounts, setKeyCounts] = useState<KeyCounts>({ total: 0, crimson: 0, jade: 0 })
+  const [doorStatus, setDoorStatus] = useState<
+    { color: HuntDoorColor; progress: number; unlocked: boolean }[]
+  >([])
   const [toast, setToast] = useState<string | null>(null)
   const [result, setResult] = useState<RunResult | null>(null)
   const [best, setBest] = useState<number | null>(null)
@@ -145,6 +156,7 @@ function SonarRoomGame() {
           timeMs: r.timeMs,
           keysFound: r.keysFound,
           pings: r.pings,
+          door: r.door === 'crimson' || r.door === 'jade' ? r.door : undefined,
         } satisfies HuntEvt)
         return
       }
@@ -195,10 +207,15 @@ function SonarRoomGame() {
     window.clearTimeout(endDelayRef.current)
     resetJoy()
     setResult(null)
-    setKeysFound(0)
+    setKeyCounts({ total: 0, crimson: 0, jade: 0 })
     setToast(null)
     setMenuVisible(false)
     engine.start(seed ?? Math.floor(Math.random() * 1e9))
+    setDoorStatus(
+      engine.doorColors
+        .filter((c): c is HuntDoorColor => c !== 'white')
+        .map((color) => ({ color, progress: 0, unlocked: false })),
+    )
     setPhase('playing')
   }, [resetJoy, setPhase, setMpStageBoth])
 
@@ -283,15 +300,29 @@ function SonarRoomGame() {
     const audio = new SoundEngine()
     audioRef.current = audio
     const engine = new SonarEngine(audio, {
-      onKeys: (n) => {
-        setKeysFound(n)
+      onKeys: (c) => {
+        setKeyCounts(c)
         if (mpActiveRef.current) {
-          netRef.current?.emit('hunt:evt', { t: 'keys', n } satisfies HuntEvt)
+          netRef.current?.emit('hunt:evt', {
+            t: 'keys',
+            crimson: c.crimson,
+            jade: c.jade,
+          } satisfies HuntEvt)
         }
       },
       onToast: showToast,
       onEnd: (r) => handleEnd(r, mpActiveRef.current),
-      onEmit: (e) => netRef.current?.emit('hunt:evt', e as HuntEvt),
+      onEmit: (e) => {
+        netRef.current?.emit('hunt:evt', e as HuntEvt)
+        // Keep the local door chips in sync with what we just announced.
+        if (e.t === 'door') {
+          setDoorStatus((ds) =>
+            ds.map((d) =>
+              d.color === e.color ? { ...d, progress: e.progress, unlocked: e.unlocked } : d,
+            ),
+          )
+        }
+      },
     })
     engineRef.current = engine
 
@@ -348,13 +379,22 @@ function SonarRoomGame() {
           break
         }
         case 'keys': {
-          setKeysFound(e.n)
-          if (e.n >= 3) {
-            audio.unlock()
-            showToast('THE DOOR IS OPEN — STOP THEM')
+          setKeyCounts({ total: e.crimson + e.jade, crimson: e.crimson, jade: e.jade })
+          if (e.crimson === 3 || e.jade === 3) {
+            showToast(`THE PREY CAN OPEN THE ${e.crimson === 3 ? 'CRIMSON' : 'JADE'} DOOR`)
           } else {
-            showToast(`THE PREY FOUND A KEY — ${e.n}/3`)
+            showToast(`PREY FOUND A KEY — CRIMSON ${e.crimson}/3 · JADE ${e.jade}/3`)
           }
+          break
+        }
+        case 'door': {
+          engine.netDoorProgress(e.i, e.progress, e.unlocked)
+          setDoorStatus((ds) =>
+            ds.map((d) =>
+              d.color === e.color ? { ...d, progress: e.progress, unlocked: e.unlocked } : d,
+            ),
+          )
+          if (e.unlocked) showToast('A DOOR JUST OPENED — STOP THEM')
           break
         }
         case 'end': {
@@ -366,7 +406,13 @@ function SonarRoomGame() {
           if (e.outcome === 'caught') audio.win()
           else audio.death()
           window.clearTimeout(endDelayRef.current)
-          setResult({ outcome: e.outcome, timeMs: e.timeMs, keysFound: e.keysFound, pings: e.pings })
+          setResult({
+            outcome: e.outcome,
+            timeMs: e.timeMs,
+            keysFound: e.keysFound,
+            pings: e.pings,
+            door: e.door,
+          })
           endDelayRef.current = window.setTimeout(() => {
             setPhase(won ? 'win' : 'dead')
             setMenuVisible(true)
@@ -610,25 +656,71 @@ function SonarRoomGame() {
       {/* ---------------- HUD (in-game) ---------------- */}
       {playing && (
         <div className="pointer-events-none absolute inset-0 z-10">
-          {/* Keys */}
-          <div
-          className="absolute left-4 top-4 flex items-center gap-3 sm:left-6 sm:top-6"
-        >
-          <span className="sr-only">Keys collected: {keysFound} of 3</span>
-          <div className="flex items-center gap-2" aria-hidden>
-            {[0, 1, 2].map((i) => (
-              <div
-                key={i}
-                className={`h-2.5 w-2.5 rotate-45 border transition-all duration-300 ${
-                  i < keysFound ? 'border-white bg-white shadow-[0_0_8px_rgba(255,255,255,0.8)]' : 'border-white/40'
-                }`}
-              />
-            ))}
+          {/* Keys — solo: white diamonds · hunt: one chip per colored door */}
+          <div className="absolute left-4 top-4 sm:left-6 sm:top-6">
+            {mpActiveRef.current && role !== null ? (
+              <div className="flex flex-col gap-1.5">
+                <span className="sr-only">
+                  Crimson keys {keyCounts.crimson} of 3, jade keys {keyCounts.jade} of 3
+                </span>
+                {(['crimson', 'jade'] as HuntDoorColor[]).map((color) => {
+                  const ds = doorStatus.find((d) => d.color === color)
+                  const n = keyCounts[color]
+                  const ready = n >= 3
+                  return (
+                    <div key={color} className="flex items-center gap-2" aria-hidden>
+                      <span
+                        className={`h-2.5 w-2.5 rotate-45 border transition-all duration-300 ${
+                          color === 'crimson'
+                            ? `border-red-400 shadow-[0_0_8px_rgba(255,70,86,0.8)] ${
+                                ready ? 'bg-red-400' : 'bg-transparent'
+                              }`
+                            : `border-emerald-400 shadow-[0_0_8px_rgba(86,255,168,0.8)] ${
+                                ready ? 'bg-emerald-400' : 'bg-transparent'
+                              }`
+                        }`}
+                      />
+                      <span
+                        className={`text-[10px] tracking-[0.3em] ${
+                          color === 'crimson' ? 'text-red-300/85' : 'text-emerald-300/85'
+                        }`}
+                      >
+                        {color.toUpperCase()} {n}/3
+                      </span>
+                      {ds?.unlocked ? (
+                        <span className="text-[9px] tracking-[0.2em] text-white">OPEN</span>
+                      ) : ds && ds.progress > 0 ? (
+                        <span className="text-[9px] tracking-[0.2em] text-white/70">
+                          UNLOCKING {Math.round(ds.progress * 100)}%
+                        </span>
+                      ) : ready && role !== 'monster' ? (
+                        <span className="animate-pulse text-[9px] tracking-[0.2em] text-white/60">
+                          GO UNLOCK
+                        </span>
+                      ) : null}
+                    </div>
+                  )
+                })}
+              </div>
+            ) : (
+              <div className="flex items-center gap-3">
+                <span className="sr-only">Keys collected: {keyCounts.total} of 3</span>
+                <div className="flex items-center gap-2" aria-hidden>
+                  {[0, 1, 2].map((i) => (
+                    <div
+                      key={i}
+                      className={`h-2.5 w-2.5 rotate-45 border transition-all duration-300 ${
+                        i < keyCounts.total
+                          ? 'border-white bg-white shadow-[0_0_8px_rgba(255,255,255,0.8)]'
+                          : 'border-white/40'
+                      }`}
+                    />
+                  ))}
+                </div>
+                <span className="text-[10px] tracking-[0.35em] text-white/40">KEYS</span>
+              </div>
+            )}
           </div>
-          <span className="text-[10px] tracking-[0.35em] text-white/40">
-            {mpActiveRef.current && role === 'monster' ? 'PREY' : 'KEYS'}
-          </span>
-        </div>
           {/* Timer + link status */}
           <div className="absolute right-4 top-4 flex items-center gap-3 sm:right-6 sm:top-6">
             {mpActiveRef.current && (
@@ -739,6 +831,10 @@ function SonarRoomGame() {
               <span className="text-white/85">THE DOOR</span>
               <span>ESCAPE</span>
             </div>
+            <div className="flex items-center justify-between gap-4">
+              <span className="text-white/85">TWO PLAYERS</span>
+              <span>2 DOORS · 6 KEYS · 3s UNLOCK</span>
+            </div>
             <div className="mt-3 border-t border-white/10 pt-3 text-center text-[10px] leading-relaxed text-white/40">
               THE RINGS REVEAL THE WALLS FOR A MOMENT.
               <br />
@@ -804,7 +900,7 @@ function SonarRoomGame() {
                     >
                       <span className="tracking-[0.35em]">THE PREY</span>
                       <span className="block pt-1 text-[9px] tracking-[0.2em] opacity-60">
-                        FIND 3 KEYS · REACH THE DOOR · STAY QUIET
+                        FIND 6 COLORED KEYS · HOLD A DOOR 3s · ESCAPE
                       </span>
                     </button>
                     <button
@@ -813,7 +909,7 @@ function SonarRoomGame() {
                     >
                       <span className="tracking-[0.35em]">THE HUNTER</span>
                       <span className="block pt-1 text-[9px] tracking-[0.2em] opacity-60">
-                        BLIND TOO · TRACK THEIR PINGS AND FOOTSTEPS · KILL
+                        BLIND TOO · GUARD TWO DOORS · KILL
                       </span>
                     </button>
                   </div>
@@ -955,8 +1051,11 @@ function SonarRoomGame() {
               <p>ENDURED {fmt(result.timeMs)}</p>
             )}
             <p>
-              KEYS {result.keysFound}/3 · PINGS {result.pings}
+              KEYS {result.keysFound}/{mpActiveRef.current ? 6 : 3} · PINGS {result.pings}
             </p>
+            {mpActiveRef.current && role === 'monster' && result.door && (
+              <p>ESCAPED THROUGH THE {result.door.toUpperCase()} DOOR</p>
+            )}
           </div>
           {mpActiveRef.current ? (
             <>
@@ -998,6 +1097,12 @@ function SonarRoomGame() {
               ? `THE HUNT LASTED ${fmt(result.timeMs)}`
               : `${fmt(result.timeMs)} · ${result.pings} PINGS`}
           </p>
+
+          {mpActiveRef.current && role !== 'monster' && result.door && (
+            <p className="-mt-5 mb-8 text-[10px] tracking-[0.4em] text-white/70">
+              THROUGH THE {result.door.toUpperCase()} DOOR
+            </p>
+          )}
 
           {!mpActiveRef.current && best !== null && (
             <p className="mb-8 text-[11px] tracking-[0.35em] text-white/70">
