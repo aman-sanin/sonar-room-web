@@ -184,7 +184,7 @@ function SonarRoomGame() {
     [loadEscapes, setPhase],
   )
 
-  const startGame = useCallback((seed?: number) => {
+  const startGame = useCallback((seed?: number, forceMp = false) => {
     const audio = audioRef.current
     const engine = engineRef.current
     if (!audio || !engine) return
@@ -194,7 +194,11 @@ function SonarRoomGame() {
     const touchable = (navigator.maxTouchPoints ?? 0) > 0 || 'ontouchstart' in window
     if (coarse || touchable) setTouchMode(true)
     // Multiplayer: role decides who simulates what. Solo: vs the AI thing.
-    const mp = mpActiveRef.current || (mpStageRef.current === 'lobby' && roleRef.current !== null)
+    // forceMp: the peer ordered this start (t:'start') — the session IS a
+    // hunt even if our local lobby refs were already torn down, otherwise
+    // we would build a solo maze and the two devices would diverge.
+    const mp =
+      forceMp || mpActiveRef.current || (mpStageRef.current === 'lobby' && roleRef.current !== null)
     mpActiveRef.current = mp
     engine.mode = mp ? (roleRef.current === 'monster' ? 'hunter' : 'host') : 'solo'
     iWantRef.current = false
@@ -363,7 +367,16 @@ function SonarRoomGame() {
       if (!e || typeof e !== 'object') return
       switch (e.t) {
         case 'start': {
-          if (phaseRef.current !== 'playing') startGame(e.seed)
+          // The host is the sole emitter of `start` (the relay is
+          // peer-to-peer), so receiving it is an ORDER: (re)start right now
+          // on exactly this seed — even if we are mid-run, on the end
+          // screen, or stuck on a locally-started maze. Unconditional is
+          // what keeps both devices on the same map; a phase guard here
+          // silently ignored the host's seed whenever we were still
+          // 'playing' (e.g. after an impatient tap on BEGIN in the lobby),
+          // leaving the two players in different mazes. Only a client that
+          // has fully left the session (no role) may ignore it.
+          if (roleRef.current) startGame(e.seed, true)
           break
         }
         case 'pos': {
@@ -847,12 +860,14 @@ function SonarRoomGame() {
             </div>
           </div>
 
-          <button
-            onClick={() => startGame()}
-            className="border border-white/50 px-12 py-3.5 text-sm tracking-[0.5em] transition-colors duration-200 hover:bg-white hover:text-black focus:outline-none focus:ring-1 focus:ring-white"
-          >
-            BEGIN
-          </button>
+          {mpStage === 'off' && (
+            <button
+              onClick={() => startGame()}
+              className="border border-white/50 px-12 py-3.5 text-sm tracking-[0.5em] transition-colors duration-200 hover:bg-white hover:text-black focus:outline-none focus:ring-1 focus:ring-white"
+            >
+              BEGIN
+            </button>
+          )}
 
           {mpStage === 'off' && (
             <button

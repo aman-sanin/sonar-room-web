@@ -109,3 +109,18 @@ Work Log:
 Stage Summary:
 - Key state is now a properly shared physical fact: when the prey pockets a key it vanishes from the hunter's world too — with a spatialized chime marking the spot. The hunter's mental map of which keys remain (and therefore which door is still reachable) stays truthful.
 - Files touched: src/lib/game/net.ts, src/lib/game/engine.ts, src/components/sonar-room.tsx (+ tests/fake-survivor.ts as a reusable MP harness).
+
+---
+Task ID: 7
+Agent: AI Assistant (main)
+Task: Fix — in 2-player mode the two devices sometimes ended up with different map layouts.
+
+Work Log:
+- Root-cause audit of every path that can put a client in-game or (re)start a round. The host is the sole emitter of the `start` event, but the guest's handler had `if (phaseRef.current !== 'playing') startGame(e.seed)` — any guest still 'playing' silently IGNORED the host's authoritative seed. The easiest real-world trigger: the menu's BEGIN button was rendered (and clickable) even while waiting in the MP lobby — `startGame()` there launches a random-seed hunt locally, and the host's `start` then arrives while phaseRef === 'playing' and is dropped → host on maze A, guest on maze B. Same guard also ate legit re-seeds after a missed `end` event or in the rematch double-press race; and a second weakness let a forced start build a SOLO maze (1 white door / 3 keys) when local lobby refs had been torn down (exitMp) — a guaranteed layout divergence of a different kind.
+- sonar-room.tsx fixes: (1) `startGame(seed?, forceMp = false)` — forceMp pins the session as a hunt even if mpActive/mpStage/role refs were reset, so the shared seed always builds the two-door hunt maze; (2) `case 'start'` is now an unconditional order — `if (roleRef.current) startGame(e.seed, true)` — a received start always (re)seeds the local world (mid-run, end screen, or a stale locally-started maze); only a client that fully left the session (role cleared) may ignore it; (3) BEGIN button now renders only at mpStage 'off' (Space/Enter was already guarded), removing the lobby desync trigger entirely.
+- tests/fake-survivor.ts rewritten as a fully event-driven harness (bun's readline on a FIFO proved unreliable for scripted commands): the peer reacts to the guest's own `keys {i:-1}` reset events — reset #1 → ping seed-A key, then an authoritative `start` with seed B MID-RUN; reset #2 arriving proves the guest obeyed the re-seed (under the old guard it never fires) → pings at seed-B key positions.
+- E2E via agent-browser through the gateway: join → hunt starts on seed 15 → screenshot shows seed-15 maze (2 crimson keys revealed) → mid-run `start seed 24` → guest reset #2 observed → screenshots show a COMPLETELY different maze (seed-24 walls, fresh spawn, timer/HUD/toast reset, jade door + jade key revealed at seed-24's positions). BEGIN hidden at choose/join stages, visible at 'off'. Zero page errors; lint + tsc clean.
+
+Stage Summary:
+- Round starts are now a strict host dictatorship: the `start` event is an unconditional re-seed order on the guest, the solo maze generator can never run for a hunt round, and the lobby no longer offers any way to launch a local run. Whatever state a client is in when the host says "go", both devices end up on the same maze.
+- Files touched: src/components/sonar-room.tsx, tests/fake-survivor.ts (harness).
