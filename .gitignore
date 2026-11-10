@@ -42,7 +42,7 @@ yarn-error.log*
 next-env.d.ts
 local-*
 .claude
-
+scripts/dev.pid
 *.log
 dev.log
 dev.out.log
