@@ -450,10 +450,10 @@ See [`sonar-room/README.md`](../sonar-room/README.md) for build instructions and
 
 ### Porting constraints
 
-- Replace `[...DIRS].sort(() => rng() - 0.5)` in `maze.ts` with an explicit Fisher–Yates shuffle so Kotlin can reproduce identical maps.
+- The maze generator now uses an explicit Fisher–Yates shuffle instead of `sort(() => rng() - 0.5)`, so map layout is reproducible outside JS.
 - Keep map arithmetic in `Double`, mirroring JavaScript numbers.
 - Keep `mulberry32` bit-for-bit (`Math.imul`, `>>> 0`).
-- Generate golden fixtures from this implementation and assert them in Kotlin JVM tests.
+- Run `bun run golden:export` after any generator change; it writes `../sonar-room/app/src/test/resources/maze-golden.txt`, which the Kotlin JVM tests assert against.
 
 ### Expansion seams (planned)
 

@@ -67,6 +67,23 @@ export function mulberry32(seed: number): () => number {
   }
 }
 
+/**
+ * In-place Fisher–Yates shuffle.
+ *
+ * Not the C `sort(() => rng() - 0.5)` trick: that is order-dependent and
+ * cannot be reproduced outside JS. This version consumes exactly N-1 random
+ * values in a fixed order, so the Kotlin port can match it bit for bit.
+ */
+export function shuffle<T>(items: T[], rng: () => number): T[] {
+  for (let i = items.length - 1; i > 0; i--) {
+    const j = Math.floor(rng() * (i + 1))
+    const tmp = items[i]
+    items[i] = items[j]
+    items[j] = tmp
+  }
+  return items
+}
+
 const idx = (c: number, r: number): number => r * MAP_COLS + c
 
 function inBounds(c: number, r: number): boolean {
@@ -263,7 +280,7 @@ export function generateMap(seed: number, hunt = false): GameMap {
   ]
   while (stack.length > 0) {
     const cur = stack[stack.length - 1]
-    const order = [...DIRS].sort(() => rng() - 0.5)
+    const order = shuffle([...DIRS], rng)
     let carved = false
     for (const d of order) {
       const nc = cur.c + d.c
