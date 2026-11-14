@@ -182,7 +182,7 @@ export class SoundEngine {
 
   // ------------------------------------------------------------------ SFX
 
-  /** The sonar "bwoop". */
+  /** Clean sonar ping: one rounded glide, no noise transient or bell overtone. */
   ping(): void {
     if (!this.ctx) return
     const t = this.ctx.currentTime
@@ -194,40 +194,26 @@ export class SoundEngine {
     o.frequency.exponentialRampToValueAtTime(175, t + 0.34)
     const g = this.ctx.createGain()
     g.gain.setValueAtTime(0, t)
-    g.gain.linearRampToValueAtTime(0.4, t + 0.014)
-    g.gain.exponentialRampToValueAtTime(0.0008, t + 0.42)
+    g.gain.linearRampToValueAtTime(0.42, t + 0.018)
+    g.gain.exponentialRampToValueAtTime(0.0006, t + 0.46)
     o.connect(g)
     g.connect(p)
     o.start(t)
-    o.stop(t + 0.46)
+    o.stop(t + 0.5)
 
+    // Short, quiet octave for definition; gone before it can ring like a bell.
     const o2 = this.ctx.createOscillator()
     o2.type = 'sine'
     o2.frequency.setValueAtTime(1520, t)
-    o2.frequency.exponentialRampToValueAtTime(350, t + 0.3)
+    o2.frequency.exponentialRampToValueAtTime(350, t + 0.22)
     const g2 = this.ctx.createGain()
     g2.gain.setValueAtTime(0, t)
-    g2.gain.linearRampToValueAtTime(0.09, t + 0.01)
-    g2.gain.exponentialRampToValueAtTime(0.0006, t + 0.34)
+    g2.gain.linearRampToValueAtTime(0.022, t + 0.012)
+    g2.gain.exponentialRampToValueAtTime(0.0003, t + 0.2)
     o2.connect(g2)
     g2.connect(p)
     o2.start(t)
-    o2.stop(t + 0.38)
-
-    const src = this.noiseSource()
-    if (src) {
-      const hp = this.ctx.createBiquadFilter()
-      hp.type = 'highpass'
-      hp.frequency.value = 2200
-      const ng = this.ctx.createGain()
-      ng.gain.setValueAtTime(0.12, t)
-      ng.gain.exponentialRampToValueAtTime(0.0005, t + 0.03)
-      src.connect(hp)
-      hp.connect(ng)
-      ng.connect(p)
-      src.start(t)
-      src.stop(t + 0.05)
-    }
+    o2.stop(t + 0.22)
   }
 
   /** The prey's sonar ping, as heard by the hunter — loud, panned, distant. */
